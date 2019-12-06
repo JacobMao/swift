@@ -712,9 +712,7 @@ public:
   static bool typeCheckTapBody(TapExpr *expr, DeclContext *DC);
 
   static Type typeCheckParameterDefault(Expr *&defaultValue, DeclContext *DC,
-                                        Type paramType,
-                                        bool isAutoClosure = false,
-                                        bool canFail = true);
+                                        Type paramType, bool isAutoClosure);
 
   static void typeCheckTopLevelCodeDecl(TopLevelCodeDecl *TLCD);
 
@@ -725,7 +723,6 @@ public:
   static void addImplicitDynamicAttribute(Decl *D);
   static void checkDeclAttributes(Decl *D);
   static void checkParameterAttributes(ParameterList *params);
-  static ValueDecl *findReplacedDynamicFunction(const ValueDecl *d);
 
   static Type checkReferenceOwnershipAttr(VarDecl *D, Type interfaceType,
                                           ReferenceOwnershipAttr *attr);
@@ -1046,7 +1043,7 @@ public:
   static void computeCaptures(AnyFunctionRef AFR);
 
   /// Check for invalid captures from stored property initializers.
-  static void checkPatternBindingCaptures(NominalTypeDecl *typeDecl);
+  static void checkPatternBindingCaptures(IterableDeclContext *DC);
 
   /// Change the context of closures in the given initializer
   /// expression to the given context.
