@@ -140,6 +140,7 @@ void BasicBlockCloner::sinkAddressProjections() {
   // Because the address projections chains will be disjoint (an instruction
   // in one chain cannot use the result of an instruction in another chain),
   // the order they are sunk does not matter.
+  InstructionDeleter deleter;
   for (auto ii = origBB->begin(), ie = origBB->end(); ii != ie;) {
     bool canSink = sinkProj.analyzeAddressProjections(&*ii);
     (void)canSink;
@@ -150,13 +151,10 @@ void BasicBlockCloner::sinkAddressProjections() {
            && "canCloneInstruction should catch this.");
 
     auto nextII = std::next(ii);
-    recursivelyDeleteTriviallyDeadInstructions(
-        &*ii, false, [&nextII](SILInstruction *deadInst) {
-          if (deadInst->getIterator() == nextII)
-            ++nextII;
-        });
+    deleter.trackIfDead(&*ii);
     ii = nextII;
   }
+  deleter.cleanUpDeadInstructions();
 }
 
 // Populate 'projections' with the chain of address projections leading
@@ -275,21 +273,26 @@ void StaticInitCloner::add(SILInstruction *initVal) {
 SingleValueInstruction *
 StaticInitCloner::clone(SingleValueInstruction *initVal) {
   assert(numOpsToClone.count(initVal) != 0 && "initVal was not added");
-  // Find the right order to clone: all operands of an instruction must be
-  // cloned before the instruction itself.
-  while (!readyToClone.empty()) {
-    SILInstruction *inst = readyToClone.pop_back_val();
+  
+  if (!isValueCloned(initVal)) {
+    // Find the right order to clone: all operands of an instruction must be
+    // cloned before the instruction itself.
+    while (!readyToClone.empty()) {
+      SILInstruction *inst = readyToClone.pop_back_val();
 
-    // Clone the instruction into the SILGlobalVariable
-    visit(inst);
+      // Clone the instruction into the SILGlobalVariable
+      visit(inst);
 
-    // Check if users of I can now be cloned.
-    for (SILValue result : inst->getResults()) {
-      for (Operand *use : result->getUses()) {
-        SILInstruction *user = use->getUser();
-        if (numOpsToClone.count(user) != 0 && --numOpsToClone[user] == 0)
-          readyToClone.push_back(user);
+      // Check if users of I can now be cloned.
+      for (SILValue result : inst->getResults()) {
+        for (Operand *use : result->getUses()) {
+          SILInstruction *user = use->getUser();
+          if (numOpsToClone.count(user) != 0 && --numOpsToClone[user] == 0)
+            readyToClone.push_back(user);
+        }
       }
+      if (inst == initVal)
+        break;
     }
   }
   return cast<SingleValueInstruction>(getMappedValue(initVal));

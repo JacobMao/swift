@@ -11,9 +11,11 @@ silopt_register_sources(
   GenericCloner.cpp
   Generics.cpp
   InstOptUtils.cpp
+  KeyPathProjector.cpp
   LoadStoreOptUtils.cpp
   LoopUtils.cpp
   OptimizerStatsUtils.cpp
+  PartialApplyCombiner.cpp
   PerformanceInlinerUtils.cpp
   SILInliner.cpp
   SILSSAUpdater.cpp

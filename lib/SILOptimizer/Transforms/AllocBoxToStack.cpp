@@ -620,11 +620,11 @@ SILFunction *PromotedParamCloner::initCloned(SILOptFunctionBuilder &FuncBuilder,
   // Create the new function type for the cloned function with some of
   // the parameters promoted.
   auto ClonedTy = SILFunctionType::get(
-      OrigFTI->getSubstGenericSignature(), OrigFTI->getExtInfo(),
+      OrigFTI->getInvocationGenericSignature(), OrigFTI->getExtInfo(),
       OrigFTI->getCoroutineKind(), OrigFTI->getCalleeConvention(),
       ClonedInterfaceArgTys, OrigFTI->getYields(), OrigFTI->getResults(),
-      OrigFTI->getOptionalErrorResult(), OrigFTI->getSubstitutions(),
-      OrigFTI->isGenericSignatureImplied(), M.getASTContext(),
+      OrigFTI->getOptionalErrorResult(), OrigFTI->getPatternSubstitutions(),
+      OrigFTI->getInvocationSubstitutions(), M.getASTContext(),
       OrigFTI->getWitnessMethodConformanceOrInvalid());
 
   assert((Orig->isTransparent() || Orig->isBare() || Orig->getLocation())
@@ -634,7 +634,7 @@ SILFunction *PromotedParamCloner::initCloned(SILOptFunctionBuilder &FuncBuilder,
   assert(!Orig->isGlobalInit() && "Global initializer cannot be cloned");
   auto *Fn = FuncBuilder.createFunction(
       SILLinkage::Shared, ClonedName, ClonedTy, Orig->getGenericEnvironment(),
-      Orig->getLocation(), Orig->isBare(), IsNotTransparent, Serialized,
+      Orig->getLocation(), Orig->isBare(), Orig->isTransparent(), Serialized,
       IsNotDynamic, Orig->getEntryCount(), Orig->isThunk(),
       Orig->getClassSubclassScope(), Orig->getInlineStrategy(),
       Orig->getEffectsKind(), Orig, Orig->getDebugScope());

@@ -84,16 +84,34 @@ SILType SILBuilder::getPartialApplyResultType(
       result = SILResultInfo(result.getReturnValueType(M, FTI),
                              ResultConvention::Owned);
   }
+  
+  // Do we still need the substitutions in the result?
+  bool needsSubstFunctionType = false;
+  for (auto param : newParams) {
+    needsSubstFunctionType |= param.getInterfaceType()->hasTypeParameter();
+  }
+  for (auto result : results) {
+    needsSubstFunctionType |= result.getInterfaceType()->hasTypeParameter();
+  }
+  for (auto yield : FTI->getYields()) {
+    needsSubstFunctionType |= yield.getInterfaceType()->hasTypeParameter();
+  }
 
-  auto appliedFnType = SILFunctionType::get(nullptr, extInfo,
+  SubstitutionMap appliedSubs;
+  if (needsSubstFunctionType) {
+    appliedSubs = FTI->getCombinedSubstitutions();
+  }
+
+  auto appliedFnType = SILFunctionType::get(nullptr,
+                                            extInfo,
                                             FTI->getCoroutineKind(),
                                             calleeConvention,
                                             newParams,
                                             FTI->getYields(),
                                             results,
                                             FTI->getOptionalErrorResult(),
+                                            appliedSubs,
                                             SubstitutionMap(),
-                                            false,
                                             M.getASTContext());
 
   return SILType::getPrimitiveObjectType(appliedFnType);
@@ -108,19 +126,6 @@ ProjectBoxInst *SILBuilder::createProjectBox(SILLocation Loc,
 
   return insert(new (getModule()) ProjectBoxInst(
       getSILDebugLocation(Loc), boxOperand, index, fieldTy));
-}
-
-// If legal, create an unchecked_ref_cast from the given operand and result
-// type, otherwise return null.
-SingleValueInstruction *
-SILBuilder::tryCreateUncheckedRefCast(SILLocation Loc, SILValue Op,
-                                      SILType ResultTy) {
-  if (!SILType::canRefCast(Op->getType(), ResultTy, getModule()))
-    return nullptr;
-
-  return insert(UncheckedRefCastInst::create(getSILDebugLocation(Loc), Op,
-                                             ResultTy, getFunction(),
-                                             C.OpenedArchetypes));
 }
 
 ClassifyBridgeObjectInst *
@@ -142,8 +147,8 @@ SILBuilder::createUncheckedBitCast(SILLocation Loc, SILValue Op, SILType Ty) {
     return insert(UncheckedTrivialBitCastInst::create(
         getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes));
 
-  if (auto refCast = tryCreateUncheckedRefCast(Loc, Op, Ty))
-    return refCast;
+  if (SILType::canRefCast(Op->getType(), Ty, getModule()))
+    return createUncheckedRefCast(Loc, Op, Ty);
 
   // The destination type is nontrivial, and may be smaller than the source
   // type, so RC identity cannot be assumed.

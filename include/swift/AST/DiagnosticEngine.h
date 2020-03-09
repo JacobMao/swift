@@ -105,7 +105,7 @@ namespace swift {
       int IntegerVal;
       unsigned UnsignedVal;
       StringRef StringVal;
-      DeclName IdentifierVal;
+      DeclNameRef IdentifierVal;
       ObjCSelector ObjCSelectorVal;
       ValueDecl *TheValueDecl;
       Type TypeVal;
@@ -133,14 +133,20 @@ namespace swift {
       : Kind(DiagnosticArgumentKind::Unsigned), UnsignedVal(I) {
     }
 
+    DiagnosticArgument(DeclNameRef R)
+        : Kind(DiagnosticArgumentKind::Identifier), IdentifierVal(R) {}
+
     DiagnosticArgument(DeclName D)
-        : Kind(DiagnosticArgumentKind::Identifier), IdentifierVal(D) {}
+        : Kind(DiagnosticArgumentKind::Identifier),
+          IdentifierVal(DeclNameRef(D)) {}
 
     DiagnosticArgument(DeclBaseName D)
-        : Kind(DiagnosticArgumentKind::Identifier), IdentifierVal(D) {}
+        : Kind(DiagnosticArgumentKind::Identifier),
+          IdentifierVal(DeclNameRef(D)) {}
 
     DiagnosticArgument(Identifier I)
-      : Kind(DiagnosticArgumentKind::Identifier), IdentifierVal(I) {
+      : Kind(DiagnosticArgumentKind::Identifier),
+        IdentifierVal(DeclNameRef(I)) {
     }
 
     DiagnosticArgument(ObjCSelector S)
@@ -225,7 +231,7 @@ namespace swift {
       return UnsignedVal;
     }
 
-    DeclName getAsIdentifier() const {
+    DeclNameRef getAsIdentifier() const {
       assert(Kind == DiagnosticArgumentKind::Identifier);
       return IdentifierVal;
     }
@@ -340,7 +346,7 @@ namespace swift {
     std::vector<Diagnostic> ChildNotes;
     SourceLoc Loc;
     bool IsChildNote = false;
-    const Decl *Decl = nullptr;
+    const swift::Decl *Decl = nullptr;
 
     friend DiagnosticEngine;
 
@@ -670,8 +676,8 @@ namespace swift {
     /// Print diagnostic names after their messages
     bool printDiagnosticNames = false;
 
-    /// Use descriptive diagnostic style when available.
-    bool useDescriptiveDiagnostics = false;
+    /// Use educational notes when available.
+    bool useEducationalNotes = false;
 
     /// Path to diagnostic documentation directory.
     std::string diagnosticDocumentationPath = "";
@@ -699,6 +705,11 @@ namespace swift {
       return state.getShowDiagnosticsAfterFatalError();
     }
 
+    void flushConsumers() {
+      for (auto consumer : Consumers)
+        consumer->flush();
+    }
+
     /// Whether to skip emitting warnings
     void setSuppressWarnings(bool val) { state.setSuppressWarnings(val); }
     bool getSuppressWarnings() const {
@@ -719,12 +730,8 @@ namespace swift {
       return printDiagnosticNames;
     }
 
-    void setUseDescriptiveDiagnostics(bool val) {
-       useDescriptiveDiagnostics = val;
-    }
-    bool getUseDescriptiveDiagnostics() const {
-      return useDescriptiveDiagnostics;
-    }
+    void setUseEducationalNotes(bool val) { useEducationalNotes = val; }
+    bool getUseEducationalNotes() const { return useEducationalNotes; }
 
     void setDiagnosticDocumentationPath(std::string path) {
       diagnosticDocumentationPath = path;

@@ -829,7 +829,8 @@ void Lexer::lexOperatorIdentifier() {
   if (CurPtr-TokStart == 1) {
     switch (TokStart[0]) {
     case '=':
-      if (leftBound != rightBound) {
+      // Refrain from emitting this message in operator name position.
+      if (NextToken.isNot(tok::kw_operator) && leftBound != rightBound) {
         auto d = diagnose(TokStart, diag::lex_unary_equal);
         if (leftBound)
           d.fixItInsert(getSourceLoc(TokStart), " ");
@@ -2482,7 +2483,8 @@ void Lexer::lexImpl() {
   }
 }
 
-Token Lexer::getTokenAtLocation(const SourceManager &SM, SourceLoc Loc) {
+Token Lexer::getTokenAtLocation(const SourceManager &SM, SourceLoc Loc,
+                                CommentRetentionMode CRM) {
   // Don't try to do anything with an invalid location.
   if (!Loc.isValid())
     return Token();
@@ -2501,7 +2503,7 @@ Token Lexer::getTokenAtLocation(const SourceManager &SM, SourceLoc Loc) {
   // (making this option irrelevant), or the caller lexed comments and
   // we need to lex just the comment token.
   Lexer L(FakeLangOpts, SM, BufferID, nullptr, LexerMode::Swift,
-          HashbangMode::Allowed, CommentRetentionMode::ReturnAsTokens);
+          HashbangMode::Allowed, CRM);
   L.restoreState(State(Loc));
   return L.peekNextToken();
 }

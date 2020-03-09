@@ -27,6 +27,7 @@
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/SourceManager.h"
+#include "swift/IDE/CodeCompletion.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
@@ -111,7 +112,7 @@ void swift::ide::typeCheckContextUntil(DeclContext *DC, SourceLoc Loc) {
     // Here, 'value' is '<error type>' unless we explicitly typecheck the
     // 'guard' statement.
     SourceFile *SF = DC->getParentSourceFile();
-    for (auto *D : SF->Decls) {
+    for (auto *D : SF->getTopLevelDecls()) {
       if (auto Code = dyn_cast<TopLevelCodeDecl>(D)) {
         typeCheckTopLevelCodeDecl(Code);
         if (Code == TLCD)
@@ -160,8 +161,6 @@ public:
   std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
     return {isInterstingRange(S), S};
   }
-
-  bool walkToDeclPre(Decl *D) override { return isInterstingRange(D); }
 
   bool walkToTypeLocPre(TypeLoc &TL) override { return false; }
   bool walkToTypeReprPre(TypeRepr *T) override { return false; }
@@ -278,21 +277,24 @@ public:
 
 /// Collect function (or subscript) members with the given \p name on \p baseTy.
 static void collectPossibleCalleesByQualifiedLookup(
-    DeclContext &DC, Type baseTy, DeclBaseName name,
+    DeclContext &DC, Type baseTy, DeclNameRef name,
     SmallVectorImpl<FunctionTypeAndDecl> &candidates) {
   bool isOnMetaType = baseTy->is<AnyMetatypeType>();
+  auto baseInstanceTy = baseTy->getMetatypeInstanceType();
 
   SmallVector<ValueDecl *, 2> decls;
-  if (!DC.lookupQualified(baseTy->getMetatypeInstanceType(), name,
+  if (!DC.lookupQualified(baseInstanceTy,
+                          name.withoutArgumentLabels(),
                           NL_QualifiedDefault | NL_ProtocolMembers,
                           decls))
     return;
 
+  auto *baseNominal = baseInstanceTy->getAnyNominal();
   for (auto *VD : decls) {
     if ((!isa<AbstractFunctionDecl>(VD) && !isa<SubscriptDecl>(VD)) ||
         VD->shouldHideFromEditor())
       continue;
-    if (!isMemberDeclApplied(&DC, baseTy->getMetatypeInstanceType(), VD))
+    if (!isMemberDeclApplied(&DC, baseInstanceTy, VD))
       continue;
     Type declaredMemberType = VD->getInterfaceType();
     if (!declaredMemberType->is<AnyFunctionType>())
@@ -315,7 +317,7 @@ static void collectPossibleCalleesByQualifiedLookup(
       }
     }
 
-    auto subs = baseTy->getMetatypeInstanceType()->getMemberSubstitutionMap(
+    auto subs = baseInstanceTy->getMemberSubstitutionMap(
         DC.getParentModule(), VD,
         VD->getInnermostDeclContext()->getGenericEnvironmentOfContext());
     auto fnType = declaredMemberType.subst(subs);
@@ -323,8 +325,7 @@ static void collectPossibleCalleesByQualifiedLookup(
       continue;
 
     if (fnType->is<AnyFunctionType>()) {
-      auto baseInstanceTy = baseTy->getMetatypeInstanceType();
-      // If we are calling to typealias type, 
+      // If we are calling to typealias type,
       if (isa<SugarType>(baseInstanceTy.getPointer())) {
         auto canBaseTy = baseInstanceTy->getCanonicalType();
         fnType = fnType.transform([&](Type t) -> Type {
@@ -333,7 +334,13 @@ static void collectPossibleCalleesByQualifiedLookup(
           return t;
         });
       }
-      candidates.emplace_back(fnType->castTo<AnyFunctionType>(), VD);
+      auto semanticContext = SemanticContextKind::CurrentNominal;
+      if (baseNominal &&
+          VD->getDeclContext()->getSelfNominalTypeDecl() != baseNominal)
+        semanticContext = SemanticContextKind::Super;
+
+      candidates.emplace_back(fnType->castTo<AnyFunctionType>(), VD,
+                              semanticContext);
     }
   }
 }
@@ -341,16 +348,22 @@ static void collectPossibleCalleesByQualifiedLookup(
 /// Collect function (or subscript) members with the given \p name on
 /// \p baseExpr expression.
 static void collectPossibleCalleesByQualifiedLookup(
-    DeclContext &DC, Expr *baseExpr, DeclBaseName name,
+    DeclContext &DC, Expr *baseExpr, DeclNameRef name,
     SmallVectorImpl<FunctionTypeAndDecl> &candidates) {
   ConcreteDeclRef ref = nullptr;
   auto baseTyOpt = getTypeOfCompletionContextExpr(
       DC.getASTContext(), &DC, CompletionTypeCheckKind::Normal, baseExpr, ref);
   if (!baseTyOpt)
     return;
-  auto baseTy = (*baseTyOpt)->getRValueType();
+
+  auto baseTy = (*baseTyOpt)->getWithoutSpecifierType();
   if (!baseTy->getMetatypeInstanceType()->mayHaveMembers())
     return;
+
+  // Use metatype for lookup 'super.init' if it's inside constructors.
+  if (isa<SuperRefExpr>(baseExpr) && isa<ConstructorDecl>(DC) &&
+      name == DeclNameRef::createConstructor())
+    baseTy = MetatypeType::get(baseTy);
 
   collectPossibleCalleesByQualifiedLookup(DC, baseTy, name, candidates);
 }
@@ -361,24 +374,17 @@ static bool collectPossibleCalleesForApply(
     SmallVectorImpl<FunctionTypeAndDecl> &candidates) {
   auto *fnExpr = callExpr->getFn();
 
-  if (auto type = fnExpr->getType()) {
-    if (!type->hasUnresolvedType() && !type->hasError()) {
-      if (auto *funcType = type->getAs<AnyFunctionType>()) {
-        auto refDecl = fnExpr->getReferencedDecl();
-        if (!refDecl)
-          if (auto apply = dyn_cast<ApplyExpr>(fnExpr))
-            refDecl = apply->getFn()->getReferencedDecl();
-        candidates.emplace_back(funcType, refDecl.getDecl());
-        return true;
-      }
-    }
-  }
-
   if (auto *DRE = dyn_cast<DeclRefExpr>(fnExpr)) {
     if (auto *decl = DRE->getDecl()) {
-      if (decl->hasInterfaceType())
-        if (auto *funcType = decl->getInterfaceType()->getAs<AnyFunctionType>())
-          candidates.emplace_back(funcType, decl);
+      Type fnType = fnExpr->getType();
+      if ((!fnType || fnType->hasError() || fnType->hasUnresolvedType()) &&
+          decl->hasInterfaceType())
+        fnType = decl->getInterfaceType();
+      if (fnType) {
+        fnType = fnType->getWithoutSpecifierType();
+        if (auto *funcTy = fnType->getAs<AnyFunctionType>())
+          candidates.emplace_back(funcTy, decl);
+      }
     }
   } else if (auto *OSRE = dyn_cast<OverloadSetRefExpr>(fnExpr)) {
     for (auto *decl : OSRE->getDecls()) {
@@ -387,29 +393,49 @@ static bool collectPossibleCalleesForApply(
           candidates.emplace_back(funcType, decl);
     }
   } else if (auto *UDE = dyn_cast<UnresolvedDotExpr>(fnExpr)) {
-    collectPossibleCalleesByQualifiedLookup(
-        DC, UDE->getBase(), UDE->getName().getBaseName(), candidates);
+    collectPossibleCalleesByQualifiedLookup(DC, UDE->getBase(), UDE->getName(),
+                                            candidates);
   } else if (auto *DSCE = dyn_cast<DotSyntaxCallExpr>(fnExpr)) {
     if (auto *DRE = dyn_cast<DeclRefExpr>(DSCE->getFn())) {
-    collectPossibleCalleesByQualifiedLookup(
-        DC, DSCE->getArg(), DRE->getDecl()->getBaseName(), candidates);
+      collectPossibleCalleesByQualifiedLookup(
+          DC, DSCE->getArg(), DeclNameRef(DRE->getDecl()->getFullName()),
+          candidates);
     }
+  } else if (auto CRCE = dyn_cast<ConstructorRefCallExpr>(fnExpr)) {
+    collectPossibleCalleesByQualifiedLookup(
+        DC, CRCE->getArg(), DeclNameRef::createConstructor(), candidates);
   }
 
-  if (candidates.empty()) {
-    ConcreteDeclRef ref = nullptr;
-    auto fnType = getTypeOfCompletionContextExpr(
-        DC.getASTContext(), &DC, CompletionTypeCheckKind::Normal, fnExpr, ref);
-    if (!fnType)
-      return false;
+  if (!candidates.empty())
+    return true;
 
-    if (auto *AFT = (*fnType)->getAs<AnyFunctionType>()) {
-      candidates.emplace_back(AFT, ref.getDecl());
-    } else if (auto *AMT = (*fnType)->getAs<AnyMetatypeType>()) {
-      auto baseTy = AMT->getInstanceType();
-      if (baseTy->mayHaveMembers())
-        collectPossibleCalleesByQualifiedLookup(
-            DC, AMT, DeclBaseName::createConstructor(), candidates);
+  ConcreteDeclRef refDecl = nullptr;
+  Type fnType = fnExpr->getType();
+  if (fnType) {
+    refDecl = fnExpr->getReferencedDecl();
+    if (!refDecl)
+      if (auto apply = dyn_cast<ApplyExpr>(fnExpr))
+        refDecl = apply->getFn()->getReferencedDecl();
+  }
+  if (!fnType) {
+    auto fnTypeOpt = getTypeOfCompletionContextExpr(
+        DC.getASTContext(), &DC, CompletionTypeCheckKind::Normal, fnExpr,
+        refDecl);
+    if (fnTypeOpt)
+      fnType = *fnTypeOpt;
+  }
+
+  if (!fnType || fnType->hasUnresolvedType() || fnType->hasError())
+    return false;
+  fnType = fnType->getWithoutSpecifierType();
+
+  if (auto *AFT = fnType->getAs<AnyFunctionType>()) {
+    candidates.emplace_back(AFT, refDecl.getDecl());
+  } else if (auto *AMT = fnType->getAs<AnyMetatypeType>()) {
+    auto baseTy = AMT->getInstanceType();
+    if (isa<TypeExpr>(fnExpr) && baseTy->mayHaveMembers()) {
+      collectPossibleCalleesByQualifiedLookup(
+          DC, AMT, DeclNameRef::createConstructor(), candidates);
     }
   }
 
@@ -430,7 +456,7 @@ static bool collectPossibleCalleesForSubscript(
     }
   } else {
     collectPossibleCalleesByQualifiedLookup(DC, subscriptExpr->getBase(),
-                                            DeclBaseName::createSubscript(),
+                                            DeclNameRef::createSubscript(),
                                             candidates);
   }
   return !candidates.empty();
@@ -442,7 +468,6 @@ static bool collectPossibleCalleesForUnresolvedMember(
     DeclContext &DC, UnresolvedMemberExpr *unresolvedMemberExpr,
     SmallVectorImpl<FunctionTypeAndDecl> &candidates) {
   auto currModule = DC.getParentModule();
-  auto baseName = unresolvedMemberExpr->getName().getBaseName();
 
   // Get the context of the expression itself.
   ExprContextInfo contextInfo(&DC, unresolvedMemberExpr);
@@ -451,10 +476,11 @@ static bool collectPossibleCalleesForUnresolvedMember(
       continue;
     SmallVector<FunctionTypeAndDecl, 2> members;
     collectPossibleCalleesByQualifiedLookup(DC, MetatypeType::get(expectedTy),
-                                            baseName, members);
+                                            unresolvedMemberExpr->getName(),
+                                            members);
     for (auto member : members) {
       if (isReferenceableByImplicitMemberExpr(currModule, &DC, expectedTy,
-                                              member.second))
+                                              member.Decl))
         candidates.push_back(member);
     }
   }
@@ -549,12 +575,12 @@ class ExprContextAnalyzer {
       SmallPtrSet<Identifier, 4> seenNames;
       for (auto &typeAndDecl : Candidates) {
         DeclContext *memberDC = nullptr;
-        if (typeAndDecl.second)
-          memberDC = typeAndDecl.second->getInnermostDeclContext();
+        if (typeAndDecl.Decl)
+          memberDC = typeAndDecl.Decl->getInnermostDeclContext();
 
-        auto Params = typeAndDecl.first->getParams();
+        auto Params = typeAndDecl.Type->getParams();
         ParameterList *paramList = nullptr;
-        if (auto VD = typeAndDecl.second) {
+        if (auto VD = typeAndDecl.Decl) {
           if (auto FD = dyn_cast<AbstractFunctionDecl>(VD))
             paramList = FD->getParameters();
           else if (auto SD = dyn_cast<SubscriptDecl>(VD))
@@ -602,10 +628,60 @@ class ExprContextAnalyzer {
       // Check context types of the array literal expression.
       ExprContextInfo arrayCtxtInfo(DC, Parent);
       for (auto arrayT : arrayCtxtInfo.getPossibleTypes()) {
-        if (auto boundGenericT = arrayT->getAs<BoundGenericType>())
+        if (auto boundGenericT = arrayT->getAs<BoundGenericType>()) {
+          // let _: [Element] = [#HERE#]
+          // In this case, 'Element' is the expected type.
           if (boundGenericT->getDecl() == Context.getArrayDecl())
             recordPossibleType(boundGenericT->getGenericArgs()[0]);
+
+          // let _: [Key : Value] = [#HERE#]
+          // In this case, 'Key' is the expected type.
+          if (boundGenericT->getDecl() == Context.getDictionaryDecl())
+            recordPossibleType(boundGenericT->getGenericArgs()[0]);
+        }
       }
+      break;
+    }
+    case ExprKind::Dictionary: {
+      // Check context types of the dictionary literal expression.
+      ExprContextInfo dictCtxtInfo(DC, Parent);
+
+      for (auto dictT : dictCtxtInfo.getPossibleTypes()) {
+        if (auto boundGenericT = dictT->getAs<BoundGenericType>()) {
+          if (boundGenericT->getDecl() == Context.getDictionaryDecl()) {
+            if (ParsedExpr->isImplicit() && isa<TupleExpr>(ParsedExpr)) {
+              // let _: [Key : Value] = [#HERE#:]
+              // let _: [Key : Value] = [#HERE#:val]
+              // let _: [Key : Value] = [key:#HERE#]
+              // In this case, this is called by 'ExprKind::Tuple' case. Return
+              // '(Key,Value)' here, 'ExprKind::Tuple' branch can decide which
+              // type in the tuple type is the exprected type.
+              SmallVector<TupleTypeElt, 2> elts;
+              for (auto genericArg : boundGenericT->getGenericArgs())
+                elts.emplace_back(genericArg);
+              recordPossibleType(TupleType::get(elts, DC->getASTContext()));
+            } else {
+              // let _: [Key : Value] = [key: val, #HERE#]
+              // In this case, assume 'Key' is the expected type.
+              if (boundGenericT->getDecl() == Context.getDictionaryDecl())
+                recordPossibleType(boundGenericT->getGenericArgs()[0]);
+            }
+          }
+        }
+      }
+      break;
+    }
+    case ExprKind::If: {
+      auto *IE = cast<IfExpr>(Parent);
+      if (IE->isFolded() &&
+          SM.rangeContains(IE->getCondExpr()->getSourceRange(),
+                           ParsedExpr->getSourceRange())) {
+        recordPossibleType(Context.getBoolDecl()->getDeclaredInterfaceType());
+        break;
+      }
+      ExprContextInfo ternaryCtxtInfo(DC, Parent);
+      for (auto ternaryT : ternaryCtxtInfo.getPossibleTypes())
+        recordPossibleType(ternaryT);
       break;
     }
     case ExprKind::Assign: {
@@ -629,13 +705,25 @@ class ExprContextAnalyzer {
       break;
     }
     case ExprKind::Tuple: {
-      if (!Parent->getType() || !Parent->getType()->is<TupleType>())
-        return;
+      TupleType *tupleT = nullptr;
+      if (Parent->getType() && Parent->getType()->is<TupleType>()) {
+        tupleT = Parent->getType()->castTo<TupleType>();
+      } else {
+        ExprContextInfo tupleCtxtInfo(DC, Parent);
+        for (auto possibleT : tupleCtxtInfo.getPossibleTypes()) {
+          if (auto possibleTupleT = possibleT->getAs<TupleType>()) {
+            tupleT = possibleTupleT;
+            break;
+          }
+        }
+        if (!tupleT)
+          return;
+      }
+
       unsigned Position = 0;
       bool HasName;
       if (getPositionInArgs(*DC, Parent, ParsedExpr, Position, HasName)) {
-        recordPossibleType(
-            Parent->getType()->castTo<TupleType>()->getElementType(Position));
+        recordPossibleType(tupleT->getElementType(Position));
       }
       break;
     }
@@ -811,7 +899,8 @@ public:
         case ExprKind::PrefixUnary:
         case ExprKind::Assign:
         case ExprKind::Array:
-          return true;
+        case ExprKind::Dictionary:
+        case ExprKind::If:
         case ExprKind::UnresolvedMember:
           return true;
         case ExprKind::Tuple: {

@@ -670,12 +670,10 @@ void ReabstractionInfo::createSubstitutedAndSpecializedTypes() {
   // Check which parameters and results can be converted from
   // indirect to direct ones.
   NumFormalIndirectResults = SubstitutedType->getNumIndirectFormalResults();
-  Conversions.resize(NumFormalIndirectResults +
-                     SubstitutedType->getParameters().size());
-
-  CanGenericSignature CanSig;
-  if (SpecializedGenericSig)
-    CanSig = SpecializedGenericSig->getCanonicalSignature();
+  unsigned NumArgs = NumFormalIndirectResults +
+    SubstitutedType->getParameters().size();
+  Conversions.resize(NumArgs);
+  TrivialArgs.resize(NumArgs);
 
   SILFunctionConventions substConv(SubstitutedType, M);
 
@@ -696,6 +694,8 @@ void ReabstractionInfo::createSubstitutedAndSpecializedTypes() {
       if (TL.isLoadable() && !RI.getReturnValueType(M, SubstitutedType)->isVoid() &&
           shouldExpand(M, ResultTy)) {
         Conversions.set(IdxForResult);
+        if (TL.isTrivial())
+          TrivialArgs.set(IdxForResult);
         break;
       }
       ++IdxForResult;
@@ -721,6 +721,8 @@ void ReabstractionInfo::createSubstitutedAndSpecializedTypes() {
     case ParameterConvention::Indirect_In:
     case ParameterConvention::Indirect_In_Guaranteed:
       Conversions.set(IdxToInsert);
+      if (TL.isTrivial())
+        TrivialArgs.set(IdxToInsert);
       break;
     case ParameterConvention::Indirect_In_Constant:
     case ParameterConvention::Indirect_Inout:
@@ -751,15 +753,14 @@ ReabstractionInfo::createSubstitutedType(SILFunction *OrigF,
     SpecializedGenericEnv = nullptr;
   }
 
-  CanGenericSignature CanSpecializedGenericSig;
-  if (SpecializedGenericSig)
-    CanSpecializedGenericSig = SpecializedGenericSig->getCanonicalSignature();
+  auto CanSpecializedGenericSig = SpecializedGenericSig.getCanonicalSignature();
 
   // First substitute concrete types into the existing function type.
   CanSILFunctionType FnTy;
   {
-    FnTy = OrigF->getLoweredFunctionType()->substGenericArgs(
-        M, SubstMap, getResilienceExpansion());
+    FnTy = OrigF->getLoweredFunctionType()
+                ->substGenericArgs(M, SubstMap, getResilienceExpansion())
+                ->getUnsubstitutedType(M);
     // FIXME: Some of the added new requirements may not have been taken into
     // account by the substGenericArgs. So, canonicalize in the context of the
     // specialized signature.
@@ -777,8 +778,9 @@ ReabstractionInfo::createSubstitutedType(SILFunction *OrigF,
   auto NewFnTy = SILFunctionType::get(
       CanSpecializedGenericSig, FnTy->getExtInfo(), FnTy->getCoroutineKind(),
       FnTy->getCalleeConvention(), FnTy->getParameters(), FnTy->getYields(),
-      FnTy->getResults(), FnTy->getOptionalErrorResult(), SubstitutionMap(),
-      false, M.getASTContext(), FnTy->getWitnessMethodConformanceOrInvalid());
+      FnTy->getResults(), FnTy->getOptionalErrorResult(),
+      FnTy->getPatternSubstitutions(), SubstitutionMap(), M.getASTContext(),
+      FnTy->getWitnessMethodConformanceOrInvalid());
 
   // This is an interface type. It should not have any archetypes.
   assert(!NewFnTy->hasArchetype());
@@ -796,14 +798,12 @@ createSpecializedType(CanSILFunctionType SubstFTy, SILModule &M) const {
   unsigned IndirectResultIdx = 0;
   for (SILResultInfo RI : SubstFTy->getResults()) {
     if (RI.isFormalIndirect()) {
+      bool isTrivial = TrivialArgs.test(IndirectResultIdx);
       if (isFormalResultConverted(IndirectResultIdx++)) {
         // Convert the indirect result to a direct result.
-        SILType SILResTy =
-          SILType::getPrimitiveObjectType(RI.getReturnValueType(M, SubstFTy));
-
         // Indirect results are passed as owned, so we also need to pass the
         // direct result as owned (except it's a trivial type).
-        auto C = (SILResTy.isTrivial(*Callee)
+        auto C = (isTrivial
                   ? ResultConvention::Unowned
                   : ResultConvention::Owned);
         SpecializedResults.push_back(SILResultInfo(RI.getReturnValueType(M, SubstFTy), C));
@@ -815,6 +815,7 @@ createSpecializedType(CanSILFunctionType SubstFTy, SILModule &M) const {
   }
   unsigned ParamIdx = 0;
   for (SILParameterInfo PI : SubstFTy->getParameters()) {
+    bool isTrivial = TrivialArgs.test(param2ArgIndex(ParamIdx));
     if (!isParamConverted(ParamIdx++)) {
       // No conversion: re-use the original, substituted parameter info.
       SpecializedParams.push_back(PI);
@@ -822,14 +823,11 @@ createSpecializedType(CanSILFunctionType SubstFTy, SILModule &M) const {
     }
 
     // Convert the indirect parameter to a direct parameter.
-    SILType SILParamTy =
-      SILType::getPrimitiveObjectType(PI.getArgumentType(M, SubstFTy));
-
     // Indirect parameters are passed as owned/guaranteed, so we also
     // need to pass the direct/guaranteed parameter as
     // owned/guaranteed (except it's a trivial type).
     auto C = ParameterConvention::Direct_Unowned;
-    if (!SILParamTy.isTrivial(*Callee)) {
+    if (!isTrivial) {
       if (PI.isGuaranteed()) {
         C = ParameterConvention::Direct_Guaranteed;
       } else {
@@ -842,11 +840,15 @@ createSpecializedType(CanSILFunctionType SubstFTy, SILModule &M) const {
     // For now, always just use the original, substituted parameter info.
     SpecializedYields.push_back(YI);
   }
+
+  auto Signature = SubstFTy->isPolymorphic()
+                     ? SubstFTy->getInvocationGenericSignature()
+                     : CanGenericSignature();
   return SILFunctionType::get(
-      SubstFTy->getInvocationGenericSignature(), SubstFTy->getExtInfo(),
+      Signature, SubstFTy->getExtInfo(),
       SubstFTy->getCoroutineKind(), SubstFTy->getCalleeConvention(),
       SpecializedParams, SpecializedYields, SpecializedResults,
-      SubstFTy->getOptionalErrorResult(), SubstitutionMap(), false,
+      SubstFTy->getOptionalErrorResult(), SubstitutionMap(), SubstitutionMap(),
       M.getASTContext(), SubstFTy->getWitnessMethodConformanceOrInvalid());
 }
 
@@ -1603,7 +1605,7 @@ void FunctionSignaturePartialSpecializer::
       CalleeGenericSig, CalleeGenericEnv, Requirements, M);
 
   if (GenPair.second) {
-    SpecializedGenericSig = GenPair.second->getCanonicalSignature();
+    SpecializedGenericSig = GenPair.second.getCanonicalSignature();
     SpecializedGenericEnv = GenPair.first;
   }
 
@@ -1644,7 +1646,7 @@ void FunctionSignaturePartialSpecializer::createSpecializedGenericSignature(
 
   auto GenPair = getSpecializedGenericEnvironmentAndSignature();
   if (GenPair.second) {
-    SpecializedGenericSig = GenPair.second->getCanonicalSignature();
+    SpecializedGenericSig = GenPair.second.getCanonicalSignature();
     SpecializedGenericEnv = GenPair.first;
     computeSpecializedInterfaceToCallerArchetypeMap();
   }
@@ -1931,15 +1933,6 @@ static void prepareCallArguments(ApplySite AI, SILBuilder &Builder,
   }
 }
 
-/// Return a substituted callee function type.
-static CanSILFunctionType
-getCalleeSubstFunctionType(SILValue Callee, SubstitutionMap Subs,
-                           TypeExpansionContext context) {
-  // Create a substituted callee type.
-  auto CanFnTy = Callee->getType().castTo<SILFunctionType>();
-  return CanFnTy->substGenericArgs(*Callee->getModule(), Subs, context);
-}
-
 /// Create a new apply based on an old one, but with a different
 /// function being applied.
 static ApplySite replaceWithSpecializedCallee(ApplySite AI,
@@ -1953,13 +1946,16 @@ static ApplySite replaceWithSpecializedCallee(ApplySite AI,
   prepareCallArguments(AI, Builder, ReInfo, Arguments, StoreResultTo);
 
   // Create a substituted callee type.
+  auto CanFnTy = Callee->getType().castTo<SILFunctionType>();
   SubstitutionMap Subs;
   if (ReInfo.getSpecializedType()->isPolymorphic()) {
     Subs = ReInfo.getCallerParamSubstitutionMap();
+    Subs = SubstitutionMap::get(CanFnTy->getSubstGenericSignature(), Subs);
   }
 
   auto CalleeSubstFnTy =
-      getCalleeSubstFunctionType(Callee, Subs, ReInfo.getResilienceExpansion());
+      CanFnTy->substGenericArgs(*Callee->getModule(), Subs,
+                                ReInfo.getResilienceExpansion());
   auto CalleeSILSubstFnTy = SILType::getPrimitiveObjectType(CalleeSubstFnTy);
   SILFunctionConventions substConv(CalleeSubstFnTy, Builder.getModule());
 
@@ -2457,6 +2453,8 @@ void swift::trySpecializeApplyOfGeneric(
       Arguments.push_back(Op.get());
     }
     auto Subs = ReInfo.getCallerParamSubstitutionMap();
+    auto FnTy = Thunk->getLoweredFunctionType();
+    Subs = SubstitutionMap::get(FnTy->getSubstGenericSignature(), Subs);
     auto *NewPAI = Builder.createPartialApply(
         PAI->getLoc(), FRI, Subs, Arguments,
         PAI->getType().getAs<SILFunctionType>()->getCalleeConvention(),

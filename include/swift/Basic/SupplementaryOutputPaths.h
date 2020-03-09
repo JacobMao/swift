@@ -149,6 +149,23 @@ struct SupplementaryOutputPaths {
   /// \sa swift::emitSwiftInterface
   std::string ModuleInterfaceOutputPath;
 
+  /// The path to which we should emit a private module interface.
+  ///
+  /// The private module interface contains all SPI decls and attributes.
+  ///
+  /// \sa ModuleInterfaceOutputPath
+  std::string PrivateModuleInterfaceOutputPath;
+
+  /// The path to a .c file where we should declare $ld$add symbols for those
+  /// symbols moved to the current module.
+  /// When symbols are moved to this module, this module declares them as HIDE
+  /// for the OS versions prior to when the move happened. On the other hand, the
+  /// original module should ADD them for these OS versions. An executable
+  /// can choose the right library to link against depending on the deployment target.
+  /// This is a walk-around that linker directives cannot specify other install
+  /// name per symbol, we should eventually remove this.
+  std::string LdAddCFilePath;
+
   SupplementaryOutputPaths() = default;
   SupplementaryOutputPaths(const SupplementaryOutputPaths &) = default;
 
@@ -158,7 +175,7 @@ struct SupplementaryOutputPaths {
            ReferenceDependenciesFilePath.empty() &&
            SerializedDiagnosticsPath.empty() && LoadedModuleTracePath.empty() &&
            TBDPath.empty() && ModuleInterfaceOutputPath.empty() &&
-           ModuleSourceInfoOutputPath.empty();
+           ModuleSourceInfoOutputPath.empty() && LdAddCFilePath.empty();
   }
 };
 } // namespace swift

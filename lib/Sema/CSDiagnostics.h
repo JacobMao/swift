@@ -113,10 +113,6 @@ public:
         });
   }
 
-  /// Resolve type variables present in the raw type, using generic parameter
-  /// types where possible.
-  Type resolveInterfaceType(Type type, bool reconstituteSugar = false) const;
-
   template <typename... ArgTypes>
   InFlightDiagnostic emitDiagnostic(ArgTypes &&... Args) const;
 
@@ -176,13 +172,6 @@ protected:
   /// of a given locator's anchor, or \c None if no such choice can be found.
   Optional<SelectedOverload> getChoiceFor(ConstraintLocator *) const;
 
-  /// For a given locator describing a function argument conversion, or a
-  /// constraint within an argument conversion, returns information about the
-  /// application of the argument to its parameter. If the locator is not
-  /// for an argument conversion, returns \c None.
-  Optional<FunctionArgApplyInfo>
-  getFunctionArgApplyInfo(ConstraintLocator *locator) const;
-
   /// \returns A new type with all of the type variables associated with
   /// generic parameters substituted back into being generic parameter type.
   Type restoreGenericParameters(
@@ -193,142 +182,6 @@ protected:
 private:
   /// Compute anchor expression associated with current diagnostic.
   std::pair<Expr *, bool> computeAnchor() const;
-};
-
-/// Provides information about the application of a function argument to a
-/// parameter.
-class FunctionArgApplyInfo {
-  ConstraintSystem &CS;
-  Expr *ArgExpr;
-  unsigned ArgIdx;
-  Type ArgType;
-
-  unsigned ParamIdx;
-
-  Type FnInterfaceType;
-  FunctionType *FnType;
-  const ValueDecl *Callee;
-
-public:
-  FunctionArgApplyInfo(ConstraintSystem &cs, Expr *argExpr, unsigned argIdx,
-                       Type argType, unsigned paramIdx, Type fnInterfaceType,
-                       FunctionType *fnType, const ValueDecl *callee)
-      : CS(cs), ArgExpr(argExpr), ArgIdx(argIdx), ArgType(argType),
-        ParamIdx(paramIdx), FnInterfaceType(fnInterfaceType), FnType(fnType),
-        Callee(callee) {}
-
-  /// \returns The argument being applied.
-  Expr *getArgExpr() const { return ArgExpr; }
-
-  /// \returns The position of the argument, starting at 1.
-  unsigned getArgPosition() const { return ArgIdx + 1; }
-
-  /// \returns The position of the parameter, starting at 1.
-  unsigned getParamPosition() const { return ParamIdx + 1; }
-
-  /// \returns The type of the argument being applied, including any generic
-  /// substitutions.
-  ///
-  /// \param withSpecifier Whether to keep the inout or @lvalue specifier of
-  /// the argument, if any.
-  Type getArgType(bool withSpecifier = false) const {
-    return withSpecifier ? ArgType : ArgType->getWithoutSpecifierType();
-  }
-
-  /// \returns The label for the argument being applied.
-  Identifier getArgLabel() const {
-    auto *parent = CS.getParentExpr(ArgExpr);
-    if (auto *te = dyn_cast<TupleExpr>(parent))
-      return te->getElementName(ArgIdx);
-
-    assert(isa<ParenExpr>(parent));
-    return Identifier();
-  }
-
-  /// \returns A textual description of the argument suitable for diagnostics.
-  /// For an argument with an unambiguous label, this will the label. Otherwise
-  /// it will be its position in the argument list.
-  StringRef getArgDescription(SmallVectorImpl<char> &scratch) const {
-    llvm::raw_svector_ostream stream(scratch);
-
-    // Use the argument label only if it's unique within the argument list.
-    auto argLabel = getArgLabel();
-    auto useArgLabel = [&]() -> bool {
-      if (argLabel.empty())
-        return false;
-
-      if (auto *te = dyn_cast<TupleExpr>(CS.getParentExpr(ArgExpr)))
-        return llvm::count(te->getElementNames(), argLabel) == 1;
-
-      return false;
-    };
-
-    if (useArgLabel()) {
-      stream << "'";
-      stream << argLabel;
-      stream << "'";
-    } else {
-      stream << "#";
-      stream << getArgPosition();
-    }
-    return StringRef(scratch.data(), scratch.size());
-  }
-
-  /// \returns The interface type for the function being applied. Note that this
-  /// may not a function type, for example it could be a generic parameter.
-  Type getFnInterfaceType() const { return FnInterfaceType; }
-
-  /// \returns The function type being applied, including any generic
-  /// substitutions.
-  FunctionType *getFnType() const { return FnType; }
-
-  /// \returns The callee for the application.
-  const ValueDecl *getCallee() const { return Callee; }
-
-private:
-  Type getParamTypeImpl(AnyFunctionType *fnTy,
-                        bool lookThroughAutoclosure) const {
-    auto param = fnTy->getParams()[ParamIdx];
-    auto paramTy = param.getPlainType();
-    if (lookThroughAutoclosure && param.isAutoClosure())
-      paramTy = paramTy->castTo<FunctionType>()->getResult();
-    return paramTy;
-  }
-
-public:
-  /// \returns The type of the parameter which the argument is being applied to,
-  /// including any generic substitutions.
-  ///
-  /// \param lookThroughAutoclosure Whether an @autoclosure () -> T parameter
-  /// should be treated as being of type T.
-  Type getParamType(bool lookThroughAutoclosure = true) const {
-    return getParamTypeImpl(FnType, lookThroughAutoclosure);
-  }
-
-  /// \returns The interface type of the parameter which the argument is being
-  /// applied to.
-  ///
-  /// \param lookThroughAutoclosure Whether an @autoclosure () -> T parameter
-  /// should be treated as being of type T.
-  Type getParamInterfaceType(bool lookThroughAutoclosure = true) const {
-    auto interfaceFnTy = FnInterfaceType->getAs<AnyFunctionType>();
-    if (!interfaceFnTy) {
-      // If the interface type isn't a function, then just return the resolved
-      // parameter type.
-      return getParamType(lookThroughAutoclosure)->mapTypeOutOfContext();
-    }
-    return getParamTypeImpl(interfaceFnTy, lookThroughAutoclosure);
-  }
-
-  /// \returns The flags of the parameter which the argument is being applied
-  /// to.
-  ParameterTypeFlags getParameterFlags() const {
-    return FnType->getParams()[ParamIdx].getParameterFlags();
-  }
-
-  ParameterTypeFlags getParameterFlagsAtIndex(unsigned idx) const {
-    return FnType->getParams()[idx].getParameterFlags();
-  }
 };
 
 /// Base class for all of the diagnostics related to generic requirement
@@ -585,36 +438,16 @@ public:
   bool diagnoseAsNote() override;
 };
 
-/// Diagnose errors related to converting function type which
-/// isn't explicitly '@escaping' to some other type.
-class NoEscapeFuncToTypeConversionFailure final : public FailureDiagnostic {
-  Type ConvertTo;
-
-public:
-  NoEscapeFuncToTypeConversionFailure(ConstraintSystem &cs,
-                                      ConstraintLocator *locator,
-                                      Type toType = Type())
-      : FailureDiagnostic(cs, locator), ConvertTo(toType) {}
-
-  bool diagnoseAsError() override;
-
-private:
-  /// Emit tailored diagnostics for no-escape parameter conversions e.g.
-  /// passing such parameter as an @escaping argument, or trying to
-  /// assign it to a variable which expects @escaping function.
-  bool diagnoseParameterUse() const;
-};
-
 /// Diagnose failures related to attempting member access on optional base
 /// type without optional chaining or force-unwrapping it first.
 class MemberAccessOnOptionalBaseFailure final : public FailureDiagnostic {
-  DeclName Member;
+  DeclNameRef Member;
   bool ResultTypeIsOptional;
 
 public:
   MemberAccessOnOptionalBaseFailure(ConstraintSystem &cs,
                                     ConstraintLocator *locator,
-                                    DeclName memberName, bool resultOptional)
+                                    DeclNameRef memberName, bool resultOptional)
       : FailureDiagnostic(cs, locator), Member(memberName),
         ResultTypeIsOptional(resultOptional) {}
 
@@ -694,23 +527,27 @@ private:
 /// e.g. argument/parameter, closure result, conversions etc.
 class ContextualFailure : public FailureDiagnostic {
   ContextualTypePurpose CTP;
-  Type FromType, ToType;
+  Type RawFromType, RawToType;
 
 public:
   ContextualFailure(ConstraintSystem &cs, Type lhs, Type rhs,
                     ConstraintLocator *locator)
-      : ContextualFailure(cs, cs.getContextualTypePurpose(), lhs, rhs,
-                          locator) {}
+      : ContextualFailure(cs,
+                          cs.getContextualTypePurpose(locator->getAnchor()),
+                          lhs, rhs, locator) {}
 
-  ContextualFailure(ConstraintSystem &cs,
-                    ContextualTypePurpose purpose, Type lhs, Type rhs,
-                    ConstraintLocator *locator)
-      : FailureDiagnostic(cs, locator), CTP(purpose),
-        FromType(resolve(lhs)), ToType(resolve(rhs)) {}
+  ContextualFailure(ConstraintSystem &cs, ContextualTypePurpose purpose,
+                    Type lhs, Type rhs, ConstraintLocator *locator)
+      : FailureDiagnostic(cs, locator), CTP(purpose), RawFromType(lhs),
+        RawToType(rhs) {}
 
-  Type getFromType() const { return FromType; }
+  Type getFromType() const { return resolve(RawFromType); }
 
-  Type getToType() const { return ToType; }
+  Type getToType() const { return resolve(RawToType); }
+
+  Type getRawFromType() const { return RawFromType; }
+
+  Type getRawToType() const { return RawToType; }
 
   bool diagnoseAsError() override;
 
@@ -718,17 +555,16 @@ public:
 
   /// If we're trying to convert something to `nil`.
   bool diagnoseConversionToNil() const;
+  
+  /// Diagnose failed conversion in a `CoerceExpr`.
+  bool diagnoseCoercionToUnrelatedType() const;
 
-  // If we're trying to convert something of type "() -> T" to T,
-  // then we probably meant to call the value.
+  /// If we're trying to convert something of type "() -> T" to T,
+  /// then we probably meant to call the value.
   bool diagnoseMissingFunctionCall() const;
 
   /// Produce a specialized diagnostic if this is an invalid conversion to Bool.
   bool diagnoseConversionToBool() const;
-
-  /// Produce a specialized diagnostic if this is an attempt to initialize
-  /// or convert an array literal to a dictionary e.g. `let _: [String: Int] = ["A", 0]`
-  bool diagnoseConversionToDictionary() const;
 
   /// Produce a specialized diagnostic if this is an attempt to throw
   /// something with doesn't conform to `Error`.
@@ -785,13 +621,8 @@ protected:
   /// protocol
   bool tryProtocolConformanceFixIt(InFlightDiagnostic &diagnostic) const;
 
-  /// Check whether this contextual failure represents an invalid
-  /// conversion from array literal to dictionary.
-  static bool isInvalidDictionaryConversion(ConstraintSystem &cs, Expr *anchor,
-                                            Type contextualType);
-
 private:
-  Type resolve(Type rawType) {
+  Type resolve(Type rawType) const {
     return resolveType(rawType)->getWithoutSpecifierType();
   }
 
@@ -813,7 +644,24 @@ protected:
   ContextualTypePurpose getContextualTypePurpose() const { return CTP; }
 
   static Optional<Diag<Type, Type>>
-  getDiagnosticFor(ContextualTypePurpose context, bool forProtocol);
+  getDiagnosticFor(ContextualTypePurpose context, Type contextualType);
+};
+
+/// Diagnose errors related to converting function type which
+/// isn't explicitly '@escaping' to some other type.
+class NoEscapeFuncToTypeConversionFailure final : public ContextualFailure {
+public:
+  NoEscapeFuncToTypeConversionFailure(ConstraintSystem &cs, Type fromType,
+                                      Type toType, ConstraintLocator *locator)
+      : ContextualFailure(cs, fromType, toType, locator) {}
+
+  bool diagnoseAsError() override;
+
+private:
+  /// Emit tailored diagnostics for no-escape parameter conversions e.g.
+  /// passing such parameter as an @escaping argument, or trying to
+  /// assign it to a variable which expects @escaping function.
+  bool diagnoseParameterUse() const;
 };
 
 /// Diagnose failures related to use of the unwrapped optional types,
@@ -977,19 +825,43 @@ protected:
 
 /// Diagnose mismatches relating to tuple destructuring.
 class TupleContextualFailure final : public ContextualFailure {
+  /// Indices of the tuple elements whose types do not match.
+  llvm::SmallVector<unsigned, 4> Indices;
+
 public:
-  TupleContextualFailure(ConstraintSystem &cs, Type lhs, Type rhs,
+  TupleContextualFailure(ConstraintSystem &cs, ContextualTypePurpose purpose,
+                         Type lhs, Type rhs, llvm::ArrayRef<unsigned> indices,
                          ConstraintLocator *locator)
-      : ContextualFailure(cs, lhs, rhs, locator) {}
+      : ContextualFailure(cs, purpose, lhs, rhs, locator),
+        Indices(indices.begin(), indices.end()) {
+    std::sort(Indices.begin(), Indices.end());
+    assert(getFromType()->is<TupleType>() && getToType()->is<TupleType>());
+  }
 
   bool diagnoseAsError() override;
 
   bool isNumElementsMismatch() const {
     auto lhsTy = getFromType()->castTo<TupleType>();
     auto rhsTy = getToType()->castTo<TupleType>();
-    assert(lhsTy && rhsTy);
     return lhsTy->getNumElements() != rhsTy->getNumElements();
   }
+};
+
+class FunctionTypeMismatch final : public ContextualFailure {
+  /// Indices of the parameters whose types do not match.
+  llvm::SmallVector<unsigned, 4> Indices;
+
+public:
+  FunctionTypeMismatch(ConstraintSystem &cs, ContextualTypePurpose purpose,
+                         Type lhs, Type rhs, llvm::ArrayRef<unsigned> indices,
+                         ConstraintLocator *locator)
+      : ContextualFailure(cs, purpose, lhs, rhs, locator),
+        Indices(indices.begin(), indices.end()) {
+    std::sort(Indices.begin(), Indices.end());
+    assert(getFromType()->is<AnyFunctionType>() && getToType()->is<AnyFunctionType>());
+  }
+
+  bool diagnoseAsError() override;
 };
 
 /// Diagnose situations when @autoclosure argument is passed to @autoclosure
@@ -1117,17 +989,17 @@ public:
 
 class InvalidMemberRefFailure : public FailureDiagnostic {
   Type BaseType;
-  DeclName Name;
+  DeclNameRef Name;
 
 public:
   InvalidMemberRefFailure(ConstraintSystem &cs, Type baseType,
-                          DeclName memberName, ConstraintLocator *locator)
+                          DeclNameRef memberName, ConstraintLocator *locator)
       : FailureDiagnostic(cs, locator), BaseType(baseType->getRValueType()),
         Name(memberName) {}
 
 protected:
   Type getBaseType() const { return BaseType; }
-  DeclName getName() const { return Name; }
+  DeclNameRef getName() const { return Name; }
 };
 
 /// Diagnose situations when member referenced by name is missing
@@ -1142,15 +1014,21 @@ protected:
 class MissingMemberFailure final : public InvalidMemberRefFailure {
 public:
   MissingMemberFailure(ConstraintSystem &cs, Type baseType,
-                       DeclName memberName, ConstraintLocator *locator)
+                       DeclNameRef memberName, ConstraintLocator *locator)
       : InvalidMemberRefFailure(cs, baseType, memberName, locator) {}
 
   bool diagnoseAsError() override;
 
 private:
+  /// Tailored diagnostics for missing special `@dynamicCallable` methods
+  /// e.g. if caller expects `dynamicallyCall(withKeywordArguments:)`
+  /// overload to be present, but a class marked as `@dynamicCallable`
+  /// defines only `dynamicallyCall(withArguments:)` variant.
+  bool diagnoseForDynamicCallable() const;
+
   static DeclName findCorrectEnumCaseName(Type Ty,
                                           TypoCorrectionResults &corrections,
-                                          DeclName memberName);
+                                          DeclNameRef memberName);
 };
 
 /// Diagnose cases where a member only accessible on generic constraints
@@ -1169,7 +1047,7 @@ private:
 class InvalidMemberRefOnExistential final : public InvalidMemberRefFailure {
 public:
   InvalidMemberRefOnExistential(ConstraintSystem &cs, Type baseType,
-                                DeclName memberName, ConstraintLocator *locator)
+                                DeclNameRef memberName, ConstraintLocator *locator)
       : InvalidMemberRefFailure(cs, baseType, memberName, locator) {}
 
   bool diagnoseAsError() override;
@@ -1194,12 +1072,12 @@ public:
 class AllowTypeOrInstanceMemberFailure final : public FailureDiagnostic {
   Type BaseType;
   ValueDecl *Member;
-  DeclName Name;
+  DeclNameRef Name;
 
 public:
   AllowTypeOrInstanceMemberFailure(ConstraintSystem &cs,
                                    Type baseType, ValueDecl *member,
-                                   DeclName name, ConstraintLocator *locator)
+                                   DeclNameRef name, ConstraintLocator *locator)
       : FailureDiagnostic(cs, locator),
         BaseType(baseType->getRValueType()), Member(member), Name(name) {
     assert(member);
@@ -1213,6 +1091,7 @@ class PartialApplicationFailure final : public FailureDiagnostic {
     MutatingMethod,
     SuperInit,
     SelfInit,
+    SuperMethod,
   };
 
   bool CompatibilityWarning;
@@ -1323,6 +1202,8 @@ public:
   }
 
   bool diagnoseAsError() override;
+
+  bool diagnoseAsNote() override;
 
   bool diagnoseSingleMissingArgument() const;
 
@@ -1488,11 +1369,11 @@ public:
   bool diagnoseAsError() override;
 };
 
-// Diagnose an attempt to use AnyObject as the root type of a KeyPath
-//
-// ```swift
-// let keyPath = \AnyObject.bar
-// ```
+/// Diagnose an attempt to use AnyObject as the root type of a KeyPath
+///
+/// ```swift
+/// let keyPath = \AnyObject.bar
+/// ```
 class AnyObjectKeyPathRootFailure final : public FailureDiagnostic {
 
 public:
@@ -1809,17 +1690,13 @@ public:
 /// func bar(_ v: Int) { foo(v) } // `Int` is not convertible to `String`
 /// ```
 class ArgumentMismatchFailure : public ContextualFailure {
-  // FIXME: Currently ArgumentMismatchFailure can be used from CSDiag, in which
-  // case it's possible we're not able to resolve the arg apply info. Once
-  // the CSDiag logic has been removed, we should be able to store Info
-  // unwrapped.
-  Optional<FunctionArgApplyInfo> Info;
+  FunctionArgApplyInfo Info;
 
 public:
-  ArgumentMismatchFailure(ConstraintSystem &cs, Type argType,
-                          Type paramType, ConstraintLocator *locator)
+  ArgumentMismatchFailure(ConstraintSystem &cs, Type argType, Type paramType,
+                          ConstraintLocator *locator)
       : ContextualFailure(cs, argType, paramType, locator),
-        Info(getFunctionArgApplyInfo(getLocator())) {}
+        Info(*cs.getFunctionArgApplyInfo(getLocator())) {}
 
   bool diagnoseAsError() override;
   bool diagnoseAsNote() override;
@@ -1842,10 +1719,10 @@ public:
 
 protected:
   /// \returns The position of the argument being diagnosed, starting at 1.
-  unsigned getArgPosition() const { return Info->getArgPosition(); }
+  unsigned getArgPosition() const { return Info.getArgPosition(); }
 
   /// \returns The position of the parameter being diagnosed, starting at 1.
-  unsigned getParamPosition() const { return Info->getParamPosition(); }
+  unsigned getParamPosition() const { return Info.getParamPosition(); }
 
   /// Returns the argument expression being diagnosed.
   ///
@@ -1855,7 +1732,7 @@ protected:
   /// the conversion from T to U may fail. In this case, \c getArgExpr() will
   /// return the (T, U) expression, whereas \c getAnchor() will return the T
   /// expression.
-  Expr *getArgExpr() const { return Info->getArgExpr(); }
+  Expr *getArgExpr() const { return Info.getArgExpr(); }
 
   /// Returns the argument type for the conversion being diagnosed.
   ///
@@ -1868,27 +1745,25 @@ protected:
   /// In this case, \c getArgType() will return T?, whereas \c getFromType()
   /// will return T.
   Type getArgType(bool withSpecifier = false) const {
-    return Info->getArgType(withSpecifier);
+    return Info.getArgType(withSpecifier);
   }
 
   /// \returns A textual description of the argument suitable for diagnostics.
   /// For an argument with an unambiguous label, this will the label. Otherwise
   /// it will be its position in the argument list.
   StringRef getArgDescription(SmallVectorImpl<char> &scratch) const {
-    return Info->getArgDescription(scratch);
+    return Info.getArgDescription(scratch);
   }
 
   /// \returns The interface type for the function being applied.
-  Type getFnInterfaceType() const { return Info->getFnInterfaceType(); }
+  Type getFnInterfaceType() const { return Info.getFnInterfaceType(); }
 
   /// \returns The function type being applied, including any generic
   /// substitutions.
-  FunctionType *getFnType() const { return Info->getFnType(); }
+  FunctionType *getFnType() const { return Info.getFnType(); }
 
   /// \returns The callee for the argument conversion, if any.
-  const ValueDecl *getCallee() const {
-    return Info ? Info->getCallee() : nullptr;
-  }
+  const ValueDecl *getCallee() const { return Info.getCallee(); }
 
   /// \returns The full name of the callee, or a null decl name if there is no
   /// callee.
@@ -1904,7 +1779,7 @@ protected:
   ///
   /// Note this may differ from \c getToType(), see the note on \c getArgType().
   Type getParamType(bool lookThroughAutoclosure = true) const {
-    return Info->getParamType(lookThroughAutoclosure);
+    return Info.getParamType(lookThroughAutoclosure);
   }
 
   /// Returns the type of the parameter involved in the mismatch.
@@ -1914,17 +1789,17 @@ protected:
   ///
   /// Note this may differ from \c getToType(), see the note on \c getArgType().
   Type getParamInterfaceType(bool lookThroughAutoclosure = true) const {
-    return Info->getParamInterfaceType(lookThroughAutoclosure);
+    return Info.getParamInterfaceType(lookThroughAutoclosure);
   }
 
   /// \returns The flags of the parameter involved in the mismatch.
   ParameterTypeFlags getParameterFlags() const {
-    return Info->getParameterFlags();
+    return Info.getParameterFlags();
   }
 
   /// \returns The flags of a parameter at a given index.
   ParameterTypeFlags getParameterFlagsAtIndex(unsigned idx) const {
-    return Info->getParameterFlagsAtIndex(idx);
+    return Info.getParameterFlagsAtIndex(idx);
   }
 
   /// Situations like this:
@@ -2018,12 +1893,54 @@ private:
 };
 
 class MissingContextualBaseInMemberRefFailure final : public FailureDiagnostic {
-  DeclName MemberName;
+  DeclNameRef MemberName;
 
 public:
-  MissingContextualBaseInMemberRefFailure(ConstraintSystem &cs, DeclName member,
+  MissingContextualBaseInMemberRefFailure(ConstraintSystem &cs,
+                                          DeclNameRef member,
                                           ConstraintLocator *locator)
       : FailureDiagnostic(cs, locator), MemberName(member) {}
+
+  bool diagnoseAsError();
+};
+
+class UnableToInferClosureReturnType final : public FailureDiagnostic {
+public:
+  UnableToInferClosureReturnType(ConstraintSystem &cs,
+                                 ConstraintLocator *locator)
+      : FailureDiagnostic(cs, locator) {}
+
+  bool diagnoseAsError();
+};
+
+class UnableToInferProtocolLiteralType final : public FailureDiagnostic {
+public:
+  UnableToInferProtocolLiteralType(ConstraintSystem &cs,
+                                   ConstraintLocator *locator)
+      : FailureDiagnostic(cs, locator) {}
+
+  bool diagnoseAsError();
+};
+
+/// Diagnose an attempt to reference a top-level name shadowed by a local
+/// member e.g.
+///
+/// ```swift
+/// extension Sequence {
+///   func test() -> Int {
+///     return max(1, 2)
+///   }
+/// }
+/// ```
+///
+/// Here `max` refers to a global function `max<T>(_: T, _: T)` in `Swift`
+/// module and can only be accessed by adding `Swift.` to it, because `Sequence`
+/// has a member named `max` which accepts a single argument.
+class MissingQuialifierInMemberRefFailure final : public FailureDiagnostic {
+public:
+  MissingQuialifierInMemberRefFailure(ConstraintSystem &cs,
+                                      ConstraintLocator *locator)
+      : FailureDiagnostic(cs, locator) {}
 
   bool diagnoseAsError();
 };

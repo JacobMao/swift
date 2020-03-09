@@ -9,12 +9,11 @@ struct Wrapper<T> {
   init(stored: T) {
     self._stored = stored
   }
-  
+
   var wrappedValue: T {
     get { _stored }
     set { _stored = newValue }
   }
-  
 }
 
 @propertyWrapper
@@ -113,7 +112,7 @@ struct MultipleInitialValues<Value> {
 struct InitialValueFailable<Value> {
   var wrappedValue: Value
 
-  init?(wrappedValue initialValue: Value) { // expected-error{{'init(wrappedValue:)' cannot be failable}}
+  init?(wrappedValue initialValue: Value) { // expected-error{{property wrapper initializer 'init(wrappedValue:)' cannot be failable}}
     return nil
   }
 }
@@ -122,7 +121,7 @@ struct InitialValueFailable<Value> {
 struct InitialValueFailableIUO<Value> {
   var wrappedValue: Value
 
-  init!(wrappedValue initialValue: Value) {  // expected-error{{'init(wrappedValue:)' cannot be failable}}
+  init!(wrappedValue initialValue: Value) {  // expected-error{{property wrapper initializer 'init(wrappedValue:)' cannot be failable}}
     return nil
   }
 }
@@ -835,6 +834,42 @@ struct UsesExplicitClosures {
 
   @WrapperAcceptingAutoclosure(body: { return 42 })
   var y: Int
+}
+
+// ---------------------------------------------------------------------------
+// Enclosing instance diagnostics
+// ---------------------------------------------------------------------------
+@propertyWrapper
+struct Observable<Value> {
+  private var stored: Value
+
+  init(wrappedValue: Value) {
+    self.stored = wrappedValue
+  }
+
+  @available(*, unavailable, message: "must be in a class")
+  var wrappedValue: Value { // expected-note{{'wrappedValue' has been explicitly marked unavailable here}}
+    get { fatalError("called wrappedValue getter") }
+    set { fatalError("called wrappedValue setter") }
+  }
+
+  static subscript<EnclosingSelf>(
+      _enclosingInstance observed: EnclosingSelf,
+      wrapped wrappedKeyPath: ReferenceWritableKeyPath<EnclosingSelf, Value>,
+      storage storageKeyPath: ReferenceWritableKeyPath<EnclosingSelf, Self>
+    ) -> Value {
+    get {
+      observed[keyPath: storageKeyPath].stored
+    }
+    set {
+      observed[keyPath: storageKeyPath].stored = newValue
+    }
+  }
+}
+
+struct MyObservedValueType {
+  @Observable // expected-error{{'wrappedValue' is unavailable: must be in a class}}
+  var observedProperty = 17
 }
 
 // ---------------------------------------------------------------------------
@@ -1835,3 +1870,28 @@ struct Rdar57411331 {
 
   var other: Int
 }
+
+// SR-11994
+@propertyWrapper
+open class OpenPropertyWrapperWithPublicInit {
+  public init(wrappedValue: String) { // Okay
+    self.wrappedValue = wrappedValue
+  }
+  
+  open var wrappedValue: String = "Hello, world"
+}
+
+// SR-11654
+
+struct SR_11654_S {}
+
+class SR_11654_C {
+  @Foo var property: SR_11654_S?
+}
+
+func sr_11654_generic_func<T>(_ argument: T?) -> T? {
+  return argument
+}
+
+let sr_11654_c = SR_11654_C()
+_ = sr_11654_generic_func(sr_11654_c.property) // Okay

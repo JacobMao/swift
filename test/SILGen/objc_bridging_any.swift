@@ -664,7 +664,7 @@ class AnyHashableClass : NSObject {
 // CHECK: [[BRIDGE:%.*]] = function_ref @$sSq19_bridgeToObjectiveCyXlyF
 // CHECK: [[FN:%.*]] = function_ref @$sIeg_ytIegr_TR
 // CHECK: partial_apply [callee_guaranteed] [[FN]]
-// CHECK: [[SELF:%.*]] = alloc_stack $Optional<@callee_guaranteed () -> @out ()>
+// CHECK: [[SELF:%.*]] = alloc_stack $Optional<@callee_guaranteed @substituted <τ_0_0> () -> @out τ_0_0 for <()>>
 // CHECK: apply [[BRIDGE]]<() -> ()>([[SELF]])
 func bridgeOptionalFunctionToAnyObject(fn: (() -> ())?) -> AnyObject {
   return fn as AnyObject
@@ -690,7 +690,15 @@ class SwiftAnyEnjoyer: NSIdLover, NSIdLoving {
   func takesId(viaProtocol x: Any) { }
 }
 
+enum SillyOptional {
+  case nothing
+  case something(NSObject)
+}
 
+func bridgeNoPayloadEnumCase(_ receiver: NSIdLover) {
+  let value = SillyOptional.nothing
+  receiver.takesId(value)
+}
 
 // CHECK-LABEL: sil_witness_table shared [serialized] GenericOption: Hashable module objc_generics {
 // CHECK-NEXT: base_protocol Equatable: GenericOption: Equatable module objc_generics

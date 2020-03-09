@@ -104,9 +104,9 @@ func testExistentialDispatchClass(cp: CP) {
 func testAnyObjectDispatch(o: AnyObject) {
   // CHECK: dynamic_method_br [[O_OBJ:%[0-9]+]] : $@opened({{.*}}) AnyObject, #ObjC.method!1.foreign, bb1, bb2
 
-  // CHECK: bb1([[METHOD:%[0-9]+]] : $@convention(objc_method) (@opened({{.*}}) AnyObject) -> @autoreleased AnyObject):
+  // CHECK: bb1([[METHOD:%[0-9]+]] : {{.*}}):
   // CHECK:   [[O_OBJ_COPY:%.*]] = copy_value [[O_OBJ]]
-  // CHECK:   [[VAR_9:%[0-9]+]] = partial_apply [callee_guaranteed] [[METHOD]]([[O_OBJ_COPY]]) : $@convention(objc_method) (@opened({{.*}}) AnyObject) -> @autoreleased AnyObject
+  // CHECK:   [[VAR_9:%[0-9]+]] = partial_apply [callee_guaranteed] [[METHOD]]([[O_OBJ_COPY]]) :
   var _ = o.method
 }
 // CHECK: } // end sil function '$s12dynamic_self21testAnyObjectDispatch1oyyXl_tF'
@@ -439,6 +439,25 @@ public class FunctionConversionTest : EmptyProtocol {
     takesNoEscapeWithSelf(fn)
 
     return self
+  }
+}
+
+public class CaptureTwoValuesTest {
+  public required init() {}
+
+  // CHECK-LABEL: sil [ossa] @$s12dynamic_self20CaptureTwoValuesTestC08capturesdE0yyFZ : $@convention(method) (@thick CaptureTwoValuesTest.Type) -> () {
+  public static func capturesTwoValues() {
+    let a = Self()
+    let b = Self()
+
+    // CHECK: function_ref @$s12dynamic_self20CaptureTwoValuesTestC08capturesdE0yyFZyycfU_ : $@convention(thin) (@guaranteed CaptureTwoValuesTest, @guaranteed CaptureTwoValuesTest) -> ()
+    _ = {
+      _ = a
+      _ = b
+      _ = Self.self
+    }
+
+    // CHECK-LABEL: sil private [ossa] @$s12dynamic_self20CaptureTwoValuesTestC08capturesdE0yyFZyycfU_ : $@convention(thin) (@guaranteed CaptureTwoValuesTest, @guaranteed CaptureTwoValuesTest) -> () {
   }
 }
 

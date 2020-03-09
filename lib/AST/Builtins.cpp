@@ -892,6 +892,15 @@ static ValueDecl *getUnsafeGuaranteedEnd(ASTContext &C, Identifier Id) {
   return getBuiltinFunction(Id, { Int8Ty }, TupleType::getEmpty(C));
 }
 
+static ValueDecl *getTypePtrAuthDiscriminator(ASTContext &C, Identifier Id) {
+  // <T : AnyObject> (T.Type) -> Int64
+  BuiltinFunctionBuilder builder(C);
+  builder.addParameter(makeMetatype(makeGenericParam()));
+  Type Int64Ty = BuiltinIntegerType::get(64, C);
+  builder.setResult(makeConcrete(Int64Ty));
+  return builder.build(Id);
+}
+
 static ValueDecl *getOnFastPath(ASTContext &Context, Identifier Id) {
   return getBuiltinFunction(Id, {}, TupleType::getEmpty(Context));
 }
@@ -938,6 +947,38 @@ static ValueDecl *getGlobalStringTablePointer(ASTContext &Context,
   // String -> Builtin.RawPointer
   auto stringType = NominalType::get(Context.getStringDecl(), Type(), Context);
   return getBuiltinFunction(Id, {stringType}, Context.TheRawPointerType);
+}
+
+static ValueDecl *getConvertStrongToUnownedUnsafe(ASTContext &ctx,
+                                                  Identifier id) {
+  // We actually want this:
+  //
+  // (T, inout unowned (unsafe) T) -> ()
+  //
+  // But for simplicity, we actually accept T, U and do the checking
+  // in the emission method that everything works up. This is a
+  // builtin, so we can crash.
+  BuiltinFunctionBuilder builder(ctx, 2);
+  builder.addParameter(makeGenericParam(0));
+  builder.addParameter(makeGenericParam(1), ValueOwnership::InOut);
+  builder.setResult(makeConcrete(TupleType::getEmpty(ctx)));
+  return builder.build(id);
+}
+
+static ValueDecl *getConvertUnownedUnsafeToGuaranteed(ASTContext &ctx,
+                                                      Identifier id) {
+  // We actually want this:
+  //
+  ///   <BaseT, T> (BaseT, @inout unowned(unsafe) T) -> T
+  //
+  // But for simplicity, we actually accept three generic params T, U and do the
+  // checking in the emission method that everything works up. This is a
+  // builtin, so we can crash.
+  BuiltinFunctionBuilder builder(ctx, 3);
+  builder.addParameter(makeGenericParam(0));                        // Base
+  builder.addParameter(makeGenericParam(1), ValueOwnership::InOut); // Unmanaged
+  builder.setResult(makeGenericParam(2)); // Guaranteed Result
+  return builder.build(id);
 }
 
 static ValueDecl *getPoundAssert(ASTContext &Context, Identifier Id) {
@@ -1349,10 +1390,14 @@ Type IntrinsicTypeDecoder::decodeImmediate() {
   case IITDescriptor::ExtendArgument:
   case IITDescriptor::TruncArgument:
   case IITDescriptor::HalfVecArgument:
+  case IITDescriptor::ScalableVecArgument:
   case IITDescriptor::VarArg:
   case IITDescriptor::Token:
   case IITDescriptor::VecElementArgument:
   case IITDescriptor::VecOfAnyPtrsToElt:
+  case IITDescriptor::VecOfBitcastsToInt:
+  case IITDescriptor::Subdivide2Argument:
+  case IITDescriptor::Subdivide4Argument:
     // These types cannot be expressed in swift yet.
     return Type();
 
@@ -1996,6 +2041,12 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
   case BuiltinValueKind::GlobalStringTablePointer:
     return getGlobalStringTablePointer(Context, Id);
 
+  case BuiltinValueKind::ConvertStrongToUnownedUnsafe:
+    return getConvertStrongToUnownedUnsafe(Context, Id);
+
+  case BuiltinValueKind::ConvertUnownedUnsafeToGuaranteed:
+    return getConvertUnownedUnsafeToGuaranteed(Context, Id);
+
   case BuiltinValueKind::PoundAssert:
     return getPoundAssert(Context, Id);
 
@@ -2007,6 +2058,9 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
                               {},
                               TupleType::getEmpty(Context));
 
+  case BuiltinValueKind::TypePtrAuthDiscriminator:
+    return getTypePtrAuthDiscriminator(Context, Id);
+    
   case BuiltinValueKind::TypeJoin:
     return getTypeJoinOperation(Context, Id);
 

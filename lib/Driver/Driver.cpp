@@ -21,7 +21,9 @@
 #include "swift/AST/DiagnosticsDriver.h"
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/Basic/LLVM.h"
+#include "swift/Basic/LangOptions.h"
 #include "swift/Basic/OutputFileMap.h"
+#include "swift/Basic/Platform.h"
 #include "swift/Basic/Range.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/TaskQueue.h"
@@ -45,6 +47,7 @@
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/OptTable.h"
+#include "llvm/Remarks/RemarkFormat.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
@@ -98,6 +101,7 @@ void Driver::parseDriverKind(ArrayRef<const char *> Args) {
   .Case("swiftc", DriverKind::Batch)
   .Case("swift-autolink-extract", DriverKind::AutolinkExtract)
   .Case("swift-indent", DriverKind::SwiftIndent)
+  .Case("swift-symbolgraph-extract", DriverKind::SymbolGraph)
   .Default(None);
   
   if (Kind.hasValue())
@@ -176,6 +180,24 @@ static void validateDebugInfoArgs(DiagnosticEngine &diags,
       diags.diagnose(SourceLoc(), diag::error_invalid_debug_prefix_map, A);
 }
 
+static void validateVerifyIncrementalDependencyArgs(DiagnosticEngine &diags,
+                                                    const ArgList &args) {
+  // No option? No problem!
+  if (!args.hasArg(options::OPT_verify_incremental_dependencies)) {
+    return;
+  }
+
+  // Make sure we see -incremental but not -wmo, no matter in what order they're
+  // in - the build systems can pass them both and just hope the last one wins.
+  if (args.hasArg(options::OPT_incremental) &&
+      !args.hasArg(options::OPT_whole_module_optimization)) {
+    return;
+  }
+
+  diags.diagnose(SourceLoc(),
+                 diag::verify_incremental_dependencies_needs_incremental);
+}
+
 static void validateCompilationConditionArgs(DiagnosticEngine &diags,
                                              const ArgList &args) {
   for (const Arg *A : args.filtered(options::OPT_D)) {
@@ -236,6 +258,7 @@ static void validateArgs(DiagnosticEngine &diags, const ArgList &args,
   validateCompilationConditionArgs(diags, args);
   validateSearchPathArgs(diags, args);
   validateAutolinkingArgs(diags, args, T);
+  validateVerifyIncrementalDependencyArgs(diags, args);
 }
 
 std::unique_ptr<ToolChain>
@@ -251,22 +274,29 @@ Driver::buildToolChain(const llvm::opt::InputArgList &ArgList) {
   case llvm::Triple::MacOSX:
   case llvm::Triple::IOS:
   case llvm::Triple::TvOS:
-  case llvm::Triple::WatchOS:
-    return llvm::make_unique<toolchains::Darwin>(*this, target);
+  case llvm::Triple::WatchOS: {
+    Optional<llvm::Triple> targetVariant;
+    if (const Arg *A = ArgList.getLastArg(options::OPT_target_variant))
+      targetVariant = llvm::Triple(llvm::Triple::normalize(A->getValue()));
+
+    return std::make_unique<toolchains::Darwin>(*this, target, targetVariant);
+  }
   case llvm::Triple::Linux:
     if (target.isAndroid())
-      return llvm::make_unique<toolchains::Android>(*this, target);
-    return llvm::make_unique<toolchains::GenericUnix>(*this, target);
+      return std::make_unique<toolchains::Android>(*this, target);
+    return std::make_unique<toolchains::GenericUnix>(*this, target);
   case llvm::Triple::FreeBSD:
-    return llvm::make_unique<toolchains::GenericUnix>(*this, target);
+    return std::make_unique<toolchains::GenericUnix>(*this, target);
+  case llvm::Triple::OpenBSD:
+    return std::make_unique<toolchains::OpenBSD>(*this, target);
   case llvm::Triple::Win32:
     if (target.isWindowsCygwinEnvironment())
-      return llvm::make_unique<toolchains::Cygwin>(*this, target);
-    return llvm::make_unique<toolchains::Windows>(*this, target);
+      return std::make_unique<toolchains::Cygwin>(*this, target);
+    return std::make_unique<toolchains::Windows>(*this, target);
   case llvm::Triple::Haiku:
-    return llvm::make_unique<toolchains::GenericUnix>(*this, target);
+    return std::make_unique<toolchains::GenericUnix>(*this, target);
   case llvm::Triple::WASI:
-    return llvm::make_unique<toolchains::GenericUnix>(*this, target);
+    return std::make_unique<toolchains::GenericUnix>(*this, target);
   default:
     Diags.diagnose(SourceLoc(), diag::error_unknown_target,
                    ArgList.getLastArg(options::OPT_target)->getValue());
@@ -295,9 +325,9 @@ std::unique_ptr<sys::TaskQueue> Driver::buildTaskQueue(const Compilation &C) {
     ArgList.hasArg(options::OPT_driver_skip_execution,
                    options::OPT_driver_print_jobs);
   if (DriverSkipExecution) {
-    return llvm::make_unique<sys::DummyTaskQueue>(NumberOfParallelCommands);
+    return std::make_unique<sys::DummyTaskQueue>(NumberOfParallelCommands);
   } else {
-    return llvm::make_unique<sys::TaskQueue>(NumberOfParallelCommands,
+    return std::make_unique<sys::TaskQueue>(NumberOfParallelCommands,
                                              C.getStatsReporter());
   }
 }
@@ -713,7 +743,9 @@ static bool computeIncremental(const llvm::opt::InputArgList *ArgList,
     return false;
 
   const char *ReasonToDisable =
-      ArgList->hasArg(options::OPT_whole_module_optimization)
+      ArgList->hasFlag(options::OPT_whole_module_optimization,
+                       options::OPT_no_whole_module_optimization,
+                       false)
           ? "is not compatible with whole module optimization."
           : ArgList->hasArg(options::OPT_embed_bitcode)
                 ? "is not currently compatible with embedding LLVM IR bitcode."
@@ -758,7 +790,7 @@ createStatsReporter(const llvm::opt::InputArgList *ArgList,
     InputName = Inputs[0].second->getSpelling();
   }
   StringRef OutputType = file_types::getExtension(OI.CompilerOutputType);
-  return llvm::make_unique<UnifiedStatsReporter>("swift-driver",
+  return std::make_unique<UnifiedStatsReporter>("swift-driver",
                                                  OI.ModuleName,
                                                  InputName,
                                                  DefaultTargetTriple,
@@ -823,7 +855,7 @@ Driver::buildCompilation(const ToolChain &TC,
   validateArgs(Diags, *TranslatedArgList, TC.getTriple());
     
   // Perform toolchain specific args validation.
-  TC.validateArguments(Diags, *TranslatedArgList);
+  TC.validateArguments(Diags, *TranslatedArgList, DefaultTargetTriple);
 
   if (Diags.hadAnyError())
     return nullptr;
@@ -951,9 +983,22 @@ Driver::buildCompilation(const ToolChain &TC,
         ArgList->hasArg(options::OPT_driver_time_compilation);
     std::unique_ptr<UnifiedStatsReporter> StatsReporter =
         createStatsReporter(ArgList.get(), Inputs, OI, DefaultTargetTriple);
+
+    const bool OnlyOneDependencyFile =
+        ArgList->hasFlag(options::OPT_enable_only_one_dependency_file,
+                         options::OPT_disable_only_one_dependency_file, false);
+
     // relies on the new dependency graph
+    // Get the default from the initializer in LangOptions.
     const bool EnableFineGrainedDependencies =
-        ArgList->hasArg(options::OPT_enable_fine_grained_dependencies);
+        ArgList->hasFlag(options::OPT_enable_fine_grained_dependencies,
+                         options::OPT_disable_fine_grained_dependencies,
+                         LangOptions().EnableFineGrainedDependencies);
+
+    const bool EnableTypeFingerprints =
+        ArgList->hasFlag(options::OPT_enable_type_fingerprints,
+                         options::OPT_disable_type_fingerprints,
+                         LangOptions().EnableTypeFingerprints);
 
     const bool VerifyFineGrainedDependencyGraphAfterEveryImport = ArgList->hasArg(
         options::
@@ -965,7 +1010,7 @@ Driver::buildCompilation(const ToolChain &TC,
         ArgList->hasArg(options::OPT_fine_grained_dependency_include_intrafile);
 
     // clang-format off
-    C = llvm::make_unique<Compilation>(
+    C = std::make_unique<Compilation>(
         Diags, TC, OI, Level,
         std::move(ArgList),
         std::move(TranslatedArgList),
@@ -984,7 +1029,9 @@ Driver::buildCompilation(const ToolChain &TC,
         SaveTemps,
         ShowDriverTimeCompilation,
         std::move(StatsReporter),
+        OnlyOneDependencyFile,
         EnableFineGrainedDependencies,
+        EnableTypeFingerprints,
         VerifyFineGrainedDependencyGraphAfterEveryImport,
         EmitFineGrainedDependencyDotFileAfterEveryImport,
         FineGrainedDependenciesIncludeIntrafileOnes,
@@ -1060,7 +1107,7 @@ parseArgsUntil(const llvm::opt::OptTable& Opts,
                unsigned FlagsToExclude,
                llvm::opt::OptSpecifier UntilOption,
                RemainingArgsHandler RemainingHandler) {
-  auto Args = llvm::make_unique<InputArgList>(ArgBegin, ArgEnd);
+  auto Args = std::make_unique<InputArgList>(ArgBegin, ArgEnd);
 
   // FIXME: Handle '@' args (or at least error on them).
 
@@ -1138,7 +1185,7 @@ Driver::parseArgStrings(ArrayRef<const char *> Args) {
         ExcludedFlagsBitmask);
 
   } else {
-    ArgList = llvm::make_unique<InputArgList>(
+    ArgList = std::make_unique<InputArgList>(
         getOpts().ParseArgs(Args, MissingArgIndex, MissingArgCount,
                             IncludedFlagsBitmask, ExcludedFlagsBitmask));
   }
@@ -1575,7 +1622,8 @@ void Driver::buildOutputInfo(const ToolChain &TC, const DerivedArgList &Args,
   } else if (Args.hasArg(options::OPT_emit_objc_header,
                          options::OPT_emit_objc_header_path,
                          options::OPT_emit_module_interface,
-                         options::OPT_emit_module_interface_path) &&
+                         options::OPT_emit_module_interface_path,
+                         options::OPT_emit_private_module_interface_path) &&
              OI.CompilerMode != OutputInfo::Mode::SingleCompile) {
     // An option has been passed which requires whole-module knowledge, but we
     // don't have that. Generate a module, but treat it as an intermediate
@@ -1747,8 +1795,13 @@ Driver::computeCompilerMode(const DerivedArgList &Args,
     return Inputs.empty() ? OutputInfo::Mode::REPL
                           : OutputInfo::Mode::Immediate;
 
+  bool UseWMO = Args.hasFlag(options::OPT_whole_module_optimization,
+                             options::OPT_no_whole_module_optimization,
+                             false);
+
   const Arg *ArgRequiringSingleCompile = Args.getLastArg(
-      options::OPT_whole_module_optimization, options::OPT_index_file);
+      options::OPT_index_file,
+      UseWMO ? options::OPT_whole_module_optimization : llvm::opt::OptSpecifier());
 
   BatchModeOut = Args.hasFlag(options::OPT_enable_batch_mode,
                               options::OPT_disable_batch_mode,
@@ -1757,6 +1810,16 @@ Driver::computeCompilerMode(const DerivedArgList &Args,
   // For best unparsed ranges, want non-batch mode, standard compile
   const Arg *ArgRequiringSinglePrimaryCompile =
       Args.getLastArg(options::OPT_enable_source_range_dependencies);
+
+  // AST dump doesn't work with `-wmo`. Since it's not common to want to dump
+  // the AST, we assume that's the priority and ignore `-wmo`, but we warn the
+  // user about this decision.
+  // FIXME: AST dump also doesn't work with `-index-file`, but that fix is a bit
+  // more complicated than this.
+  if (UseWMO && Args.hasArg(options::OPT_dump_ast)) {
+    Diags.diagnose(SourceLoc(), diag::warn_ignoring_wmo);
+    return OutputInfo::Mode::StandardCompile;
+  }
 
   // Override batch mode if given -wmo or -index-file.
   if (ArgRequiringSingleCompile) {
@@ -1900,8 +1963,12 @@ void Driver::buildActions(SmallVectorImpl<const Action *> &TopLevelActions,
       case file_types::TY_ImportedModules:
       case file_types::TY_TBD:
       case file_types::TY_ModuleTrace:
-      case file_types::TY_OptRecord:
+      case file_types::TY_YAMLOptRecord:
+      case file_types::TY_BitstreamOptRecord:
       case file_types::TY_SwiftModuleInterfaceFile:
+      case file_types::TY_PrivateSwiftModuleInterfaceFile:
+      case file_types::TY_SwiftCrossImportDir:
+      case file_types::TY_SwiftOverlayFile:
         // We could in theory handle assembly or LLVM input, but let's not.
         // FIXME: What about LTO?
         Diags.diagnose(SourceLoc(), diag::error_unexpected_input_file,
@@ -2043,9 +2110,12 @@ void Driver::buildActions(SmallVectorImpl<const Action *> &TopLevelActions,
     for (const Action *A : AllLinkerInputs)
       if (A->getType() == file_types::TY_Object)
         AutolinkExtractInputs.push_back(A);
-    if (!AutolinkExtractInputs.empty() &&
-        (TC.getTriple().getObjectFormat() == llvm::Triple::ELF ||
-         TC.getTriple().isOSCygMing())) {
+    const auto &Triple = TC.getTriple();
+    const bool AutolinkExtractRequired =
+        (Triple.getObjectFormat() == llvm::Triple::ELF && !Triple.isPS4()) ||
+        Triple.getObjectFormat() == llvm::Triple::Wasm ||
+        Triple.isOSCygMing();
+    if (!AutolinkExtractInputs.empty() && AutolinkExtractRequired) {
       auto *AutolinkExtractAction =
           C.createAction<AutolinkExtractJobAction>(AutolinkExtractInputs);
       // Takes the same inputs as the linker...
@@ -2055,8 +2125,9 @@ void Driver::buildActions(SmallVectorImpl<const Action *> &TopLevelActions,
 
     if (MergeModuleAction) {
       if (OI.DebugInfoLevel == IRGenDebugInfoLevel::Normal) {
-        if (TC.getTriple().getObjectFormat() == llvm::Triple::ELF ||
-            TC.getTriple().getObjectFormat() == llvm::Triple::COFF) {
+        const bool ModuleWrapRequired =
+            Triple.getObjectFormat() != llvm::Triple::MachO;
+        if (ModuleWrapRequired) {
           auto *ModuleWrapAction =
               C.createAction<ModuleWrapJobAction>(MergeModuleAction);
           LinkAction->addInput(ModuleWrapAction);
@@ -2122,6 +2193,46 @@ bool Driver::handleImmediateArgs(const ArgList &Args, const ToolChain &TC) {
     DriverExecutable = commandArgs[0];
     DriverExecutableArgs.assign(std::begin(commandArgs) + 1,
                                 std::end(commandArgs));
+  }
+
+  if (Args.hasArg(options::OPT_print_target_info)) {
+    SmallVector<const char *, 5> commandLine;
+    commandLine.push_back("-frontend");
+    commandLine.push_back("-print-target-info");
+    if (const Arg *targetArg = Args.getLastArg(options::OPT_target)) {
+      commandLine.push_back("-target");
+      commandLine.push_back(targetArg->getValue());
+    }
+    if (const Arg *targetVariantArg =
+            Args.getLastArg(options::OPT_target_variant)) {
+      commandLine.push_back("-target-variant");
+      commandLine.push_back(targetVariantArg->getValue());
+    }
+    if (const Arg *sdkArg = Args.getLastArg(options::OPT_sdk)) {
+      commandLine.push_back("-sdk");
+      commandLine.push_back(sdkArg->getValue());
+    }
+
+    if (const Arg *resourceDirArg = Args.getLastArg(options::OPT_resource_dir)) {
+      commandLine.push_back("-resource-dir");
+      commandLine.push_back(resourceDirArg->getValue());
+    }
+
+    std::string executable = getSwiftProgramPath();
+
+    // FIXME: This bypasses mechanisms like -v and -###. (SR-12119)
+    sys::TaskQueue queue;
+    queue.addTask(executable.c_str(), commandLine);
+    queue.execute(nullptr,
+                  [](sys::ProcessId PID, int returnCode,
+                      StringRef output, StringRef errors,
+                      sys::TaskProcessInformation ProcInfo,
+                      void *unused) -> sys::TaskFinishedResponse {
+      llvm::outs() << output;
+      llvm::errs() << errors;
+      return sys::TaskFinishedResponse::ContinueExecution;
+    });
+    return false;
   }
 
   return true;
@@ -2263,7 +2374,7 @@ static StringRef baseNameForImage(const JobAction *JA, const OutputInfo &OI,
   if (JA->size() == 1 && OI.ModuleNameIsFallback && BaseInput != "-")
     return llvm::sys::path::stem(BaseInput);
   
-  if (auto link = dyn_cast<StaticLinkJobAction>(JA)) {
+  if (isa<StaticLinkJobAction>(JA)) {
     Buffer = "lib";
     Buffer.append(BaseName);
     Buffer.append(Triple.isOSWindows() ? ".lib" : ".a");
@@ -2387,60 +2498,74 @@ static bool hasExistingAdditionalOutput(CommandOutput &output,
   return false;
 }
 
-static void addAuxiliaryOutput(
+static llvm::SmallString<128> computeAuxiliaryOutputPath(
     Compilation &C, CommandOutput &output, file_types::ID outputType,
     const TypeToPathMap *outputMap, StringRef workingDirectory,
     StringRef outputPath = StringRef(),
     llvm::opt::OptSpecifier requireArg = llvm::opt::OptSpecifier()) {
 
   if (hasExistingAdditionalOutput(output, outputType, outputPath))
-    return;
+    return {};
 
-  StringRef outputMapPath;
   if (outputMap) {
     auto iter = outputMap->find(outputType);
-    if (iter != outputMap->end())
-      outputMapPath = iter->second;
+    if (iter != outputMap->end()) {
+      StringRef outputMapPath = iter->second;
+      // Prefer a path from the OutputMap.
+      if (!outputMapPath.empty())
+        return outputMapPath;
+    }
   }
+  if (!outputPath.empty())
+    return outputPath;
 
-  if (!outputMapPath.empty()) {
-    // Prefer a path from the OutputMap.
-    output.setAdditionalOutputForType(outputType, outputMapPath);
-  } else if (!outputPath.empty()) {
-    output.setAdditionalOutputForType(outputType, outputPath);
-  } else if (requireArg.isValid() && !C.getArgs().getLastArg(requireArg)) {
+  if (requireArg.isValid() && !C.getArgs().getLastArg(requireArg)) {
     // This auxiliary output only exists if requireArg is passed, but it
     // wasn't this time.
-    return;
-  } else {
-    // Put the auxiliary output file next to "the" primary output file.
-    //
-    // FIXME: when we're in WMO and have multiple primary outputs, we derive the
-    // additional filename here from the _first_ primary output name, which
-    // means that in the derived OFM (in Job.cpp) the additional output will
-    // have a possibly-surprising name. But that's only half the problem: it
-    // also get associated with the first primary _input_, even when there are
-    // multiple primary inputs; really it should be associated with the build as
-    // a whole -- derived OFM input "" -- but that's a more general thing to
-    // fix.
-    llvm::SmallString<128> path;
-    if (output.getPrimaryOutputType() != file_types::TY_Nothing)
-      path = output.getPrimaryOutputFilenames()[0];
-    else if (!output.getBaseInput(0).empty())
-      path = llvm::sys::path::filename(output.getBaseInput(0));
-    else {
-      formFilenameFromBaseAndExt(C.getOutputInfo().ModuleName, /*newExt=*/"",
-                                 workingDirectory, path);
-    }
-    assert(!path.empty());
-
-    bool isTempFile = C.isTemporaryFile(path);
-    llvm::sys::path::replace_extension(
-        path, file_types::getExtension(outputType));
-    output.setAdditionalOutputForType(outputType, path);
-    if (isTempFile)
-      C.addTemporaryFile(path);
+    return {};
   }
+
+  // Put the auxiliary output file next to "the" primary output file.
+  //
+  // FIXME: when we're in WMO and have multiple primary outputs, we derive the
+  // additional filename here from the _first_ primary output name, which
+  // means that in the derived OFM (in Job.cpp) the additional output will
+  // have a possibly-surprising name. But that's only half the problem: it
+  // also get associated with the first primary _input_, even when there are
+  // multiple primary inputs; really it should be associated with the build as
+  // a whole -- derived OFM input "" -- but that's a more general thing to
+  // fix.
+  llvm::SmallString<128> path;
+  if (output.getPrimaryOutputType() != file_types::TY_Nothing)
+    path = output.getPrimaryOutputFilenames()[0];
+  else if (!output.getBaseInput(0).empty())
+    path = llvm::sys::path::filename(output.getBaseInput(0));
+  else {
+    formFilenameFromBaseAndExt(C.getOutputInfo().ModuleName, /*newExt=*/"",
+                               workingDirectory, path);
+  }
+  assert(!path.empty());
+
+  const bool isTempFile = C.isTemporaryFile(path);
+  llvm::sys::path::replace_extension(path,
+                                     file_types::getExtension(outputType));
+  if (isTempFile)
+    C.addTemporaryFile(path);
+  return path;
+}
+
+static void addAuxiliaryOutput(
+    Compilation &C, CommandOutput &output, file_types::ID outputType,
+    const TypeToPathMap *outputMap, StringRef workingDirectory,
+    StringRef outputPath = StringRef(),
+    llvm::opt::OptSpecifier requireArg = llvm::opt::OptSpecifier()) {
+
+  const auto path =
+      computeAuxiliaryOutputPath(C, output, outputType, outputMap,
+                                 workingDirectory, outputPath, requireArg);
+  if (path.empty())
+    return;
+  output.setAdditionalOutputForType(outputType, path);
 }
 
 static void addDiagFileOutputForPersistentPCHAction(
@@ -2626,12 +2751,20 @@ Job *Driver::buildJobsForAction(Compilation &C, const JobAction *JA,
   if (OI.ShouldGenerateModule &&
       (isa<CompileJobAction>(JA) || isa<MergeModuleJobAction>(JA))) {
     chooseSwiftModuleDocOutputPath(C, OutputMap, workingDirectory, Output.get());
-    chooseSwiftSourceInfoOutputPath(C, OutputMap, workingDirectory, Output.get());
+    if (!C.getArgs().hasArg(options::OPT_avoid_emit_module_source_info)) {
+      chooseSwiftSourceInfoOutputPath(C, OutputMap, workingDirectory,
+                                      Output.get());
+    }
   }
 
   if (C.getArgs().hasArg(options::OPT_emit_module_interface,
                          options::OPT_emit_module_interface_path))
-    chooseModuleInterfacePath(C, JA, workingDirectory, Buf, Output.get());
+    chooseModuleInterfacePath(C, JA, workingDirectory, Buf,
+      file_types::TY_SwiftModuleInterfaceFile, Output.get());
+
+  if (C.getArgs().hasArg(options::OPT_emit_private_module_interface_path))
+    chooseModuleInterfacePath(C, JA, workingDirectory, Buf,
+      file_types::TY_PrivateSwiftModuleInterfaceFile, Output.get());
 
   if (C.getArgs().hasArg(options::OPT_update_code) && isa<CompileJobAction>(JA))
     chooseRemappingOutputPath(C, OutputMap, Output.get());
@@ -2656,6 +2789,7 @@ Job *Driver::buildJobsForAction(Compilation &C, const JobAction *JA,
                                   Output.get());
 
   if (C.getArgs().hasArg(options::OPT_save_optimization_record,
+                         options::OPT_save_optimization_record_EQ,
                          options::OPT_save_optimization_record_path))
     chooseOptimizationRecordPath(C, workingDirectory, Buf, Output.get());
 
@@ -2962,9 +3096,10 @@ void Driver::chooseRemappingOutputPath(Compilation &C,
 }
 
 void Driver::chooseModuleInterfacePath(Compilation &C, const JobAction *JA,
-                                          StringRef workingDirectory,
-                                          llvm::SmallString<128> &buffer,
-                                          CommandOutput *output) const {
+                                       StringRef workingDirectory,
+                                       llvm::SmallString<128> &buffer,
+                                       file_types::ID fileType,
+                                       CommandOutput *output) const {
   switch (C.getOutputInfo().CompilerMode) {
   case OutputInfo::Mode::StandardCompile:
   case OutputInfo::Mode::BatchModeCompile:
@@ -2980,13 +3115,14 @@ void Driver::chooseModuleInterfacePath(Compilation &C, const JobAction *JA,
     llvm_unreachable("these modes aren't usable with 'swiftc'");
   }
 
+  auto pathOpt = fileType == file_types::TY_SwiftModuleInterfaceFile?
+    options::OPT_emit_module_interface_path:
+    options::OPT_emit_private_module_interface_path;
+
   StringRef outputPath = *getOutputFilenameFromPathArgOrAsTopLevel(
-      C.getOutputInfo(), C.getArgs(),
-      options::OPT_emit_module_interface_path,
-      file_types::TY_SwiftModuleInterfaceFile,
+      C.getOutputInfo(), C.getArgs(), pathOpt, fileType,
       /*TreatAsTopLevelOutput*/true, workingDirectory, buffer);
-  output->setAdditionalOutputForType(file_types::TY_SwiftModuleInterfaceFile,
-                                     outputPath);
+  output->setAdditionalOutputForType(fileType, outputPath);
 }
 
 void Driver::chooseSerializedDiagnosticsPath(Compilation &C,
@@ -3019,8 +3155,12 @@ void Driver::chooseDependenciesOutputPaths(Compilation &C,
                                            llvm::SmallString<128> &Buf,
                                            CommandOutput *Output) const {
   if (C.getArgs().hasArg(options::OPT_emit_dependencies)) {
-    addAuxiliaryOutput(C, *Output, file_types::TY_Dependencies, OutputMap,
-                       workingDirectory);
+    auto depPath = computeAuxiliaryOutputPath(
+        C, *Output, file_types::TY_Dependencies, OutputMap, workingDirectory);
+    C.addDependencyPathOrCreateDummy(depPath, [&] {
+      addAuxiliaryOutput(C, *Output, file_types::TY_Dependencies, OutputMap,
+                         workingDirectory);
+    });
   }
   if (C.getIncrementalBuildEnabled()) {
     file_types::forEachIncrementalOutputType([&](file_types::ID type) {
@@ -3086,12 +3226,18 @@ void Driver::chooseOptimizationRecordPath(Compilation &C,
                                           CommandOutput *Output) const {
   const OutputInfo &OI = C.getOutputInfo();
   if (OI.CompilerMode == OutputInfo::Mode::SingleCompile) {
+    llvm::Expected<file_types::ID> FileType =
+        C.getToolChain().remarkFileTypeFromArgs(C.getArgs());
+    if (!FileType) {
+      Diags.diagnose({}, diag::error_creating_remark_serializer,
+                     llvm::toString(FileType.takeError()));
+      return;
+    }
     auto filename = *getOutputFilenameFromPathArgOrAsTopLevel(
-        OI, C.getArgs(), options::OPT_save_optimization_record_path,
-        file_types::TY_OptRecord, /*TreatAsTopLevelOutput=*/true,
-        workingDirectory, Buf);
+        OI, C.getArgs(), options::OPT_save_optimization_record_path, *FileType,
+        /*TreatAsTopLevelOutput=*/true, workingDirectory, Buf);
 
-    Output->setAdditionalOutputForType(file_types::TY_OptRecord, filename);
+    Output->setAdditionalOutputForType(*FileType, filename);
   } else
     // FIXME: We should use the OutputMap in this case.
     Diags.diagnose({}, diag::warn_opt_remark_disabled);
@@ -3179,6 +3325,7 @@ void Driver::printHelp(bool ShowHidden) const {
   case DriverKind::Batch:
   case DriverKind::AutolinkExtract:
   case DriverKind::SwiftIndent:
+  case DriverKind::SymbolGraph:
     ExcludedFlagsBitmask |= options::NoBatchOption;
     break;
   }

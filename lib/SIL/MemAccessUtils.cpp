@@ -14,11 +14,64 @@
 
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/ApplySite.h"
+#include "swift/SIL/Projection.h"
 #include "swift/SIL/SILGlobalVariable.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILUndef.h"
 
 using namespace swift;
+
+SILValue swift::stripAccessMarkers(SILValue v) {
+  while (auto *bai = dyn_cast<BeginAccessInst>(v)) {
+    v = bai->getOperand();
+  }
+  return v;
+}
+
+// The resulting projection must have an address-type operand at index zero
+// representing the projected address.
+SingleValueInstruction *swift::isAccessProjection(SILValue v) {
+  switch (v->getKind()) {
+  default:
+    return nullptr;
+
+  case ValueKind::StructElementAddrInst:
+  case ValueKind::TupleElementAddrInst:
+  case ValueKind::UncheckedTakeEnumDataAddrInst:
+  case ValueKind::TailAddrInst:
+  case ValueKind::IndexAddrInst:
+    return cast<SingleValueInstruction>(v);
+  };
+}
+
+// TODO: When the optimizer stops stripping begin_access markers, then we should
+// be able to assert that the result is a BeginAccessInst and the default case
+// is unreachable.
+SILValue swift::getAccessedAddress(SILValue v) {
+  while (true) {
+    assert(v->getType().isAddress());
+    auto *projection = isAccessProjection(v);
+    if (!projection)
+      return v;
+
+    v = projection->getOperand(0);
+  }
+}
+
+bool swift::isLetAddress(SILValue accessedAddress) {
+  assert(accessedAddress == getAccessedAddress(accessedAddress)
+         && "caller must find the address root");
+  // Is this an address of a "let" class member?
+  if (auto *rea = dyn_cast<RefElementAddrInst>(accessedAddress))
+    return rea->getField()->isLet();
+
+  // Is this an address of a global "let"?
+  if (auto *gai = dyn_cast<GlobalAddrInst>(accessedAddress)) {
+    auto *globalDecl = gai->getReferencedGlobal()->getDecl();
+    return globalDecl && globalDecl->isLet();
+  }
+  return false;
+}
 
 AccessedStorage::AccessedStorage(SILValue base, Kind kind) {
   assert(base && "invalid storage base");
@@ -659,4 +712,65 @@ SILBasicBlock::iterator swift::removeBeginAccess(BeginAccessInst *beginAccess) {
     }
   }
   return beginAccess->getParent()->erase(beginAccess);
+}
+
+bool swift::isSingleInitAllocStack(AllocStackInst *asi,
+                                   SmallVectorImpl<Operand *> &destroyingUses) {
+  // For now, we just look through projections and rely on memInstMustInitialize
+  // to classify all other uses as init or not.
+  SmallVector<Operand *, 32> worklist(asi->getUses());
+  bool foundInit = false;
+
+  while (!worklist.empty()) {
+    auto *use = worklist.pop_back_val();
+    auto *user = use->getUser();
+
+    if (Projection::isAddressProjection(user) ||
+        isa<OpenExistentialAddrInst>(user)) {
+      // Look through address projections.
+      for (SILValue r : user->getResults()) {
+        llvm::copy(r->getUses(), std::back_inserter(worklist));
+      }
+      continue;
+    }
+
+    if (auto *li = dyn_cast<LoadInst>(user)) {
+      // If we are not taking,
+      if (li->getOwnershipQualifier() != LoadOwnershipQualifier::Take) {
+        continue;
+      }
+      // Treat load [take] as a write.
+      return false;
+    }
+
+    switch (user->getKind()) {
+    default:
+      break;
+    case SILInstructionKind::DestroyAddrInst:
+      destroyingUses.push_back(use);
+      continue;
+    case SILInstructionKind::DeallocStackInst:
+    case SILInstructionKind::LoadBorrowInst:
+    case SILInstructionKind::DebugValueAddrInst:
+      continue;
+    }
+
+    // See if we have an initializer and that such initializer is in the same
+    // block.
+    if (memInstMustInitialize(use)) {
+      if (user->getParent() != asi->getParent() || foundInit) {
+        return false;
+      }
+
+      foundInit = true;
+      continue;
+    }
+
+    // Otherwise, if we have found something not in our whitelist, return false.
+    return false;
+  }
+
+  // We did not find any users that we did not understand. So we can
+  // conservatively return true here.
+  return true;
 }

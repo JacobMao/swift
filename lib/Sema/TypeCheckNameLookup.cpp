@@ -194,6 +194,12 @@ namespace {
           addResult(found);
           return;
         }
+      } else if (isa<NominalTypeDecl>(found)) {
+        // Declaring nested types inside other types is currently
+        // not supported by lookup would still return such members
+        // so we have to account for that here as well.
+        addResult(found);
+        return;
       }
 
       // FIXME: the "isa<ProtocolDecl>()" check will be wrong for
@@ -223,11 +229,10 @@ convertToUnqualifiedLookupOptions(NameLookupOptions options) {
   return newOptions;
 }
 
-LookupResult TypeChecker::lookupUnqualified(DeclContext *dc, DeclName name,
+LookupResult TypeChecker::lookupUnqualified(DeclContext *dc, DeclNameRef name,
                                             SourceLoc loc,
                                             NameLookupOptions options) {
   auto ulOptions = convertToUnqualifiedLookupOptions(options);
-
   auto &ctx = dc->getASTContext();
   auto descriptor = UnqualifiedLookupDescriptor(name, dc, loc, ulOptions);
   auto lookup = evaluateOrDefault(ctx.evaluator,
@@ -240,13 +245,21 @@ LookupResult TypeChecker::lookupUnqualified(DeclContext *dc, DeclName name,
     // Determine which type we looked through to find this result.
     Type foundInType;
 
-    if (auto *baseDC = found.getDeclContext()) {
-      if (!baseDC->isTypeContext()) {
-        baseDC = baseDC->getParent();
-        assert(baseDC->isTypeContext());
+    if (auto *typeDC = found.getDeclContext()) {
+      if (!typeDC->isTypeContext()) {
+        // If we don't have a type context this is an implicit 'self' reference.
+        if (auto *CE = dyn_cast<ClosureExpr>(typeDC)) {
+          // If we found the result in a self capture, look through the capture.
+          assert(CE->getCapturedSelfDecl());
+          typeDC = found.getValueDecl()->getDeclContext();
+        } else {
+          // Otherwise, we must have the method context.
+          typeDC = typeDC->getParent();
+        }
+        assert(typeDC->isTypeContext());
       }
       foundInType = dc->mapTypeIntoContext(
-        baseDC->getDeclaredInterfaceType());
+        typeDC->getDeclaredInterfaceType());
       assert(foundInType && "bogus base declaration?");
     }
 
@@ -257,7 +270,7 @@ LookupResult TypeChecker::lookupUnqualified(DeclContext *dc, DeclName name,
 }
 
 LookupResult
-TypeChecker::lookupUnqualifiedType(DeclContext *dc, DeclName name,
+TypeChecker::lookupUnqualifiedType(DeclContext *dc, DeclNameRef name,
                                    SourceLoc loc,
                                    NameLookupOptions options) {
   auto &ctx = dc->getASTContext();
@@ -290,7 +303,7 @@ TypeChecker::lookupUnqualifiedType(DeclContext *dc, DeclName name,
 }
 
 LookupResult TypeChecker::lookupMember(DeclContext *dc,
-                                       Type type, DeclName name,
+                                       Type type, DeclNameRef name,
                                        NameLookupOptions options) {
   assert(type->mayHaveMembers());
 
@@ -310,6 +323,11 @@ LookupResult TypeChecker::lookupMember(DeclContext *dc,
   // We handle our own overriding/shadowing filtering.
   subOptions &= ~NL_RemoveOverridden;
   subOptions &= ~NL_RemoveNonVisible;
+
+  // Make sure we've resolved implicit members, if we need them.
+  if (auto *current = type->getAnyNominal()) {
+    current->synthesizeSemanticMembersIfNeeded(name.getFullName());
+  }
 
   LookupResultBuilder builder(result, dc, options);
   SmallVector<ValueDecl *, 4> lookupResults;
@@ -370,7 +388,7 @@ bool TypeChecker::isUnsupportedMemberTypeAccess(Type type, TypeDecl *typeDecl) {
 }
 
 LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
-                                               Type type, Identifier name,
+                                               Type type, DeclNameRef name,
                                                NameLookupOptions options) {
   LookupTypeResult result;
 
@@ -384,6 +402,11 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
     subOptions |= NL_ProtocolMembers;
   if (options.contains(NameLookupFlags::IgnoreAccessControl))
     subOptions |= NL_IgnoreAccessControl;
+
+  // Make sure we've resolved implicit members, if we need them.
+  if (auto *current = type->getAnyNominal()) {
+    current->synthesizeSemanticMembersIfNeeded(name.getFullName());
+  }
 
   if (!dc->lookupQualified(type, name, subOptions, decls))
     return result;
@@ -503,10 +526,10 @@ LookupTypeResult TypeChecker::lookupMemberType(DeclContext *dc,
 
 LookupResult TypeChecker::lookupConstructors(DeclContext *dc, Type type,
                                              NameLookupOptions options) {
-  return lookupMember(dc, type, DeclBaseName::createConstructor(), options);
+  return lookupMember(dc, type, DeclNameRef::createConstructor(), options);
 }
 
-unsigned TypeChecker::getCallEditDistance(DeclName writtenName,
+unsigned TypeChecker::getCallEditDistance(DeclNameRef writtenName,
                                           DeclName correctedName,
                                           unsigned maxEditDistance) {
   // TODO: consider arguments.
@@ -542,7 +565,7 @@ unsigned TypeChecker::getCallEditDistance(DeclName writtenName,
   return distance;
 }
 
-static bool isPlausibleTypo(DeclRefKind refKind, DeclName typedName,
+static bool isPlausibleTypo(DeclRefKind refKind, DeclNameRef typedName,
                             ValueDecl *candidate) {
   // Ignore anonymous declarations.
   if (!candidate->hasName())

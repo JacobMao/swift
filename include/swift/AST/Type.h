@@ -47,6 +47,7 @@ class NormalProtocolConformance;
 class ProtocolConformanceRef;
 class ProtocolDecl;
 class ProtocolType;
+class SILModule;
 class StructDecl;
 class SubstitutableType;
 class SubstitutionMap;
@@ -370,6 +371,9 @@ private:
   void operator==(Type T) const = delete;
   void operator!=(Type T) const = delete;
 };
+
+/// Extract the source location from a given type.
+SourceLoc extractNearestSourceLoc(Type ty);
 
 /// CanType - This is a Type that is statically known to be canonical.  To get
 /// one of these, use Type->getCanonicalType().  Since all CanType's can be used

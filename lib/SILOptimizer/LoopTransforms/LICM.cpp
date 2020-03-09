@@ -502,7 +502,7 @@ bool LoopTreeOptimization::optimize() {
     // Collect all summary of all sub loops of the current loop. Since we
     // process the loop tree bottom up they are guaranteed to be available in
     // the map.
-    auto CurrLoopSummary = llvm::make_unique<LoopNestSummary>(CurrentLoop);
+    auto CurrLoopSummary = std::make_unique<LoopNestSummary>(CurrentLoop);
     propagateSummaries(CurrLoopSummary);
 
     // If the current loop changed, then we might reveal more instr to hoist
@@ -991,7 +991,7 @@ void LoopTreeOptimization::hoistLoadsAndStores(SILValue addr, SILLoop *loop, Ins
   }
 
   // In case the value is only stored but never loaded in the loop.
-  recursivelyDeleteTriviallyDeadInstructions(initialLoad);
+  eliminateDeadInstruction(initialLoad);
 }
 
 bool LoopTreeOptimization::hoistAllLoadsAndStores(SILLoop *loop) {

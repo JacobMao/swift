@@ -49,7 +49,7 @@ static void diagnoseScopedImports(DiagnosticEngine &diags,
   for (const ModuleDecl::ImportedModule &importPair : imports) {
     if (importPair.first.empty())
       continue;
-    diags.diagnose(importPair.first.front().second,
+    diags.diagnose(importPair.first.front().Loc,
                    diag::module_interface_scoped_import_unsupported);
   }
 }
@@ -83,12 +83,15 @@ llvm::Regex swift::getSwiftInterfaceModuleFlagsRegex() {
 
 /// Prints the imported modules in \p M to \p out in the form of \c import
 /// source declarations.
-static void printImports(raw_ostream &out, ModuleDecl *M) {
+static void printImports(raw_ostream &out,
+                         ModuleInterfaceOptions const &Opts,
+                         ModuleDecl *M) {
   // FIXME: This is very similar to what's in Serializer::writeInputBlock, but
   // it's not obvious what higher-level optimization would be factored out here.
   ModuleDecl::ImportFilter allImportFilter;
   allImportFilter |= ModuleDecl::ImportFilterKind::Public;
   allImportFilter |= ModuleDecl::ImportFilterKind::Private;
+  allImportFilter |= ModuleDecl::ImportFilterKind::SPIAccessControl;
 
   SmallVector<ModuleDecl::ImportedModule, 8> allImports;
   M->getImportedModules(allImports, allImportFilter);
@@ -104,22 +107,32 @@ static void printImports(raw_ostream &out, ModuleDecl *M) {
   publicImportSet.insert(publicImports.begin(), publicImports.end());
 
   for (auto import : allImports) {
-    if (import.second->isOnoneSupportModule() ||
-        import.second->isBuiltinModule()) {
+    auto importedModule = import.second;
+    if (importedModule->isOnoneSupportModule() ||
+        importedModule->isBuiltinModule()) {
       continue;
     }
 
     if (publicImportSet.count(import))
       out << "@_exported ";
+
+    // SPI attribute on imports
+    if (Opts.PrintSPIs) {
+      SmallVector<Identifier, 4> spis;
+      M->lookupImportedSPIGroups(importedModule, spis);
+      for (auto spiName : spis)
+        out << "@_spi(" << spiName << ") ";
+    }
+
     out << "import ";
-    import.second->getReverseFullModuleName().printForward(out);
+    importedModule->getReverseFullModuleName().printForward(out);
 
     // Write the access path we should be honoring but aren't.
     // (See diagnoseScopedImports above.)
     if (!import.first.empty()) {
       out << "/*";
       for (const auto &accessPathElem : import.first)
-        out << "." << accessPathElem.first;
+        out << "." << accessPathElem.Item;
       out << "*/";
     }
 
@@ -341,6 +354,9 @@ public:
     if (ExtraProtocols.empty())
       return;
 
+    if (!printOptions.shouldPrint(nominal))
+      return;
+
     SmallPtrSet<ProtocolDecl *, 16> handledProtocols;
 
     // First record all protocols that have already been handled.
@@ -437,10 +453,10 @@ bool swift::emitSwiftInterface(raw_ostream &out,
   assert(M);
 
   printToolVersionAndFlagsComment(out, Opts, M);
-  printImports(out, M);
+  printImports(out, Opts, M);
 
   const PrintOptions printOptions = PrintOptions::printSwiftInterfaceFile(
-      Opts.PreserveTypesAsWritten);
+      Opts.PreserveTypesAsWritten, Opts.PrintFullConvention, Opts.PrintSPIs);
   InheritedProtocolCollector::PerTypeMap inheritedProtocolMap;
 
   SmallVector<Decl *, 16> topLevelDecls;

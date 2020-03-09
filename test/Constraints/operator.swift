@@ -218,7 +218,6 @@ func rdar46459603() {
 
   _ = arr.values == [e]
   // expected-error@-1 {{binary operator '==' cannot be applied to operands of type 'Dictionary<String, E>.Values' and '[E]'}}
-  // expected-note@-2  {{expected an argument list of type '(Self, Self)'}}
   _ = [arr.values] == [[e]]
   // expected-error@-1 {{value of protocol type 'Any' cannot conform to 'Equatable'; only struct/enum/class types can conform to protocols}}
   // expected-note@-2 {{requirement from conditional conformance of '[Any]' to 'Equatable'}}
@@ -255,3 +254,14 @@ extension Int {
 }
 
 _ = 1 ^^ 2 ^^ 3 * 4 // expected-error {{adjacent operators are in unordered precedence groups 'PowerPrecedence' and 'MultiplicationPrecedence'}}
+
+// rdar://problem/60185506 - Ambiguity with Float comparison
+func rdar_60185506() {
+  struct X {
+    var foo: Float
+  }
+
+  func test(x: X?) {
+    let _ = (x?.foo ?? 0) <= 0.5 // Ok
+  }
+}

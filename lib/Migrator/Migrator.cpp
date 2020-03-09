@@ -9,7 +9,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Basic/Diff.h"
+#include "Diff.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Migrator/ASTMigratorPass.h"
 #include "swift/Migrator/EditorAdapter.h"
@@ -146,7 +146,7 @@ Migrator::performAFixItMigration(version::Version SwiftLanguageVersion) {
                   input.isPrimary() ? InputBuffer.get() : input.buffer()));
   }
 
-  auto Instance = llvm::make_unique<swift::CompilerInstance>();
+  auto Instance = std::make_unique<swift::CompilerInstance>();
   if (Instance->setup(Invocation)) {
     return nullptr;
   }
@@ -185,7 +185,7 @@ bool Migrator::performSyntacticPasses(SyntacticPassOptions Opts) {
     new clang::DiagnosticIDs()
   };
   auto ClangDiags =
-    llvm::make_unique<clang::DiagnosticsEngine>(DummyClangDiagIDs,
+    std::make_unique<clang::DiagnosticsEngine>(DummyClangDiagIDs,
                                                 new clang::DiagnosticOptions,
                                                 new clang::DiagnosticConsumer(),
                                                 /*ShouldOwnClient=*/true);

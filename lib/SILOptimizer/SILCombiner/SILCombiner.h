@@ -65,6 +65,10 @@ class SILCombiner :
   /// If set to true then the optimizer is free to erase cond_fail instructions.
   bool RemoveCondFails;
 
+  /// Set to true if some alloc/dealloc_stack instruction are inserted and at
+  /// the end of the run stack nesting needs to be corrected.
+  bool invalidatedStackNesting = false;
+
   /// The current iteration of the SILCombine.
   unsigned Iteration;
 
@@ -236,8 +240,6 @@ public:
   // the result bit.
   SILInstruction *optimizeBuiltinCompareEq(BuiltinInst *AI, bool NegateResult);
 
-  SILInstruction *tryOptimizeApplyOfPartialApply(PartialApplyInst *PAI);
-
   SILInstruction *optimizeApplyOfConvertFunctionInst(FullApplySite AI,
                                                      ConvertFunctionInst *CFI);
 
@@ -253,6 +255,15 @@ public:
                                        StringRef FInverseName, StringRef FName);
 
 private:
+  InstModCallbacks getInstModCallbacks() {
+    return InstModCallbacks(
+        [this](SILInstruction *DeadInst) { eraseInstFromFunction(*DeadInst); },
+        [this](SILInstruction *NewInst) { Worklist.add(NewInst); },
+        [this](SILValue oldValue, SILValue newValue) {
+          replaceValueUsesWith(oldValue, newValue);
+        });
+  }
+
   FullApplySite rewriteApplyCallee(FullApplySite apply, SILValue callee);
 
   // Build concrete existential information using findInitExistential.

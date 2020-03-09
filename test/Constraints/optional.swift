@@ -391,8 +391,8 @@ func sr8411() {
 
   _ = S(&foo)      // Ok
   _ = S.init(&foo) // Ok
-  _ = S.foo(&foo)  // Ok
-  _ = S.bar(&foo, 42) // Ok
+  S.foo(&foo)  // Ok
+  S.bar(&foo, 42) // Ok
 }
 
 // SR-11104 - Slightly misleading diagnostics for contextual failures with multiple fixes
@@ -401,4 +401,29 @@ func sr_11104() {
 
   bar(["hello"].first)
   // expected-error@-1 {{cannot convert value of type 'String?' to expected argument type 'Int'}}
+}
+
+// rdar://problem/57668873 - Too eager force optional unwrap fix
+
+@objc class Window {}
+
+@objc protocol WindowDelegate {
+  @objc optional var window: Window? { get set }
+}
+
+func test_force_unwrap_not_being_too_eager() {
+  struct WindowContainer {
+    unowned(unsafe) var delegate: WindowDelegate? = nil
+  }
+
+  let obj: WindowContainer = WindowContainer()
+  if let _ = obj.delegate?.window { // Ok
+  }
+}
+
+// rdar://problem/57097401
+func invalidOptionalChaining(a: Any) {
+  a == "="? // expected-error {{cannot use optional chaining on non-optional value of type 'String'}}
+  // expected-error@-1 {{value of protocol type 'Any' cannot conform to 'Equatable'; only struct/enum/class types can conform to protocols}}
+  // expected-note@-2 {{requirement from conditional conformance of 'Any?' to 'Equatable'}}
 }

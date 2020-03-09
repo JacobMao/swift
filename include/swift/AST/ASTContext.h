@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -25,6 +25,7 @@
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeAlignments.h"
 #include "swift/Basic/LangOptions.h"
+#include "swift/Basic/Located.h"
 #include "swift/Basic/Malloc.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -62,6 +63,8 @@ namespace swift {
   class Decl;
   class DeclContext;
   class DefaultArgumentInitializer;
+  class DerivativeAttr;
+  class DifferentiableAttr;
   class ExtensionDecl;
   class ForeignRepresentationInfo;
   class FuncDecl;
@@ -107,10 +110,12 @@ namespace swift {
   struct RawComment;
   class DocComment;
   class SILBoxType;
+  class SILTransform;
   class TypeAliasDecl;
   class VarDecl;
   class UnifiedStatsReporter;
   class IndexSubset;
+  struct SILAutoDiffDerivativeFunctionKey;
 
   enum class KnownProtocolKind : uint8_t;
 
@@ -281,6 +286,28 @@ public:
   /// The next auto-closure discriminator.  This needs to be preserved
   /// across invocations of both the parser and the type-checker.
   unsigned NextAutoClosureDiscriminator = 0;
+
+  /// Cached mapping from types to their associated tangent spaces.
+  llvm::DenseMap<Type, Optional<TangentSpace>> AutoDiffTangentSpaces;
+
+  /// A cache of derivative function types per configuration.
+  llvm::DenseMap<SILAutoDiffDerivativeFunctionKey, CanSILFunctionType>
+      SILAutoDiffDerivativeFunctions;
+
+  /// Cache of `@differentiable` attributes keyed by parameter indices. Used to
+  /// diagnose duplicate `@differentiable` attributes for the same key.
+  llvm::DenseMap<std::pair<Decl *, IndexSubset *>, DifferentiableAttr *>
+      DifferentiableAttrs;
+
+  /// Cache of `@derivative` attributes keyed by parameter indices and
+  /// derivative function kind. Used to diagnose duplicate `@derivative`
+  /// attributes for the same key.
+  // TODO(TF-1042): remove `DerivativeAttrs` from `ASTContext`. Serialize
+  // derivative function configurations per original `AbstractFunctionDecl`.
+  llvm::DenseMap<
+      std::tuple<Decl *, IndexSubset *, AutoDiffDerivativeFunctionKind>,
+      llvm::SmallPtrSet<DerivativeAttr *, 1>>
+      DerivativeAttrs;
 
 private:
   /// The current generation number, which reflects the number of
@@ -478,6 +505,9 @@ public:
   /// Get the '+' function on two String.
   FuncDecl *getPlusFunctionOnString() const;
 
+  /// Get Sequence.makeIterator().
+  FuncDecl *getSequenceMakeIterator() const;
+
   /// Check whether the standard library provides all the correct
   /// intrinsic support for Optional<T>.
   ///
@@ -514,6 +544,9 @@ public:
   ConcreteDeclRef getBuiltinInitDecl(NominalTypeDecl *decl,
                                      KnownProtocolKind builtinProtocol,
                 llvm::function_ref<DeclName (ASTContext &ctx)> initName) const;
+  
+  /// Retrieve the declaration of Swift.<(Int, Int) -> Bool.
+  FuncDecl *getLessThanIntDecl() const;
 
   /// Retrieve the declaration of Swift.==(Int, Int) -> Bool.
   FuncDecl *getEqualIntDecl() const;
@@ -571,6 +604,10 @@ public:
                        const FunctionType::ExtInfo incompleteExtInfo,
                        FunctionTypeRepresentation trueRep);
 
+  /// Get the Swift declaration that a Clang declaration was exported from,
+  /// if applicable.
+  const Decl *getSwiftDeclForExportedClangDecl(const clang::Decl *decl);
+
   /// Determine whether the given Swift type is representable in a
   /// given foreign language.
   ForeignRepresentationInfo
@@ -587,9 +624,26 @@ public:
   void addDestructorCleanup(T &object) {
     addCleanup([&object]{ object.~T(); });
   }
+
+  /// Get the runtime availability of the class metadata update callback
+  /// mechanism for the target platform.
+  AvailabilityContext getObjCMetadataUpdateCallbackAvailability();
+
+  /// Get the runtime availability of the objc_getClass() hook for the target
+  /// platform.
+  AvailabilityContext getObjCGetClassHookAvailability();
   
-  /// Get the runtime availability of the opaque types language feature for the target platform.
+  /// Get the runtime availability of features introduced in the Swift 5.0
+  /// compiler for the target platform.
+  AvailabilityContext getSwift50Availability();
+
+  /// Get the runtime availability of the opaque types language feature for the
+  /// target platform.
   AvailabilityContext getOpaqueTypeAvailability();
+
+  /// Get the runtime availability of the objc_loadClassref() entry point for
+  /// the target platform.
+  AvailabilityContext getObjCClassStubsAvailability();
 
   /// Get the runtime availability of features introduced in the Swift 5.1
   /// compiler for the target platform.
@@ -598,6 +652,22 @@ public:
   /// Get the runtime availability of
   /// swift_getTypeByMangledNameInContextInMetadataState.
   AvailabilityContext getTypesInAbstractMetadataStateAvailability();
+
+  /// Get the runtime availability of support for prespecialized generic 
+  /// metadata.
+  AvailabilityContext getPrespecializedGenericMetadataAvailability();
+
+  /// Get the runtime availability of features introduced in the Swift 5.2
+  /// compiler for the target platform.
+  AvailabilityContext getSwift52Availability();
+
+  /// Get the runtime availability of features introduced in the Swift 5.3
+  /// compiler for the target platform.
+  AvailabilityContext getSwift53Availability();
+
+  /// Get the runtime availability of features that have been introduced in the
+  /// Swift compiler for future versions of the target platform.
+  AvailabilityContext getSwiftFutureAvailability();
 
 
   //===--------------------------------------------------------------------===//
@@ -707,12 +777,12 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  bool canImportModule(std::pair<Identifier, SourceLoc> ModulePath);
+  bool canImportModule(Located<Identifier> ModulePath);
 
   /// \returns a module with a given name that was already loaded.  If the
   /// module was not loaded, returns nullptr.
   ModuleDecl *getLoadedModule(
-      ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath) const;
+      ArrayRef<Located<Identifier>> ModulePath) const;
 
   ModuleDecl *getLoadedModule(Identifier ModuleName) const;
 
@@ -722,7 +792,7 @@ public:
   /// be returned.
   ///
   /// \returns The requested module, or NULL if the module cannot be found.
-  ModuleDecl *getModule(ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath);
+  ModuleDecl *getModule(ArrayRef<Located<Identifier>> ModulePath);
 
   ModuleDecl *getModuleByName(StringRef ModuleName);
 
@@ -925,6 +995,15 @@ public:
 
   /// Each kind and SourceFile has its own cache for a Type.
   Type &getDefaultTypeRequestCache(SourceFile *, KnownProtocolKind);
+
+  using SILTransformCtors = ArrayRef<SILTransform *(*)(void)>;
+
+  /// Register IRGen specific SIL passes such that the SILOptimizer can access
+  /// and execute them without directly depending on IRGen.
+  void registerIRGenSILTransforms(SILTransformCtors fns);
+
+  /// Retrieve the IRGen specific SIL passes.
+  SILTransformCtors getIRGenSILTransforms() const;
 
 private:
   friend Decl;

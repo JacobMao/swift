@@ -86,6 +86,8 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.RemarkOnRebuildFromModuleInterface |=
     Args.hasArg(OPT_Rmodule_interface_rebuild);
 
+  Opts.DisableInterfaceFileLock |= Args.hasArg(OPT_disable_interface_lockfile);
+
   computePrintStatsOptions();
   computeDebugTimeOptions();
   computeTBDOptions();
@@ -103,6 +105,10 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.IgnoreSwiftSourceInfo |= Args.hasArg(OPT_ignore_module_source_info);
   computeHelpOptions();
+
+  if (Args.hasArg(OPT_print_target_info)) {
+    Opts.PrintTargetInfo = true;
+  }
 
   if (const Arg *A = Args.getLastArg(OPT_verify_generic_signatures)) {
     Opts.VerifyGenericSignaturesInModule = A->getValue();
@@ -170,8 +176,7 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.EnableSourceImport |= Args.hasArg(OPT_enable_source_import);
   Opts.ImportUnderlyingModule |= Args.hasArg(OPT_import_underlying_module);
-  Opts.EnableSerializationNestedTypeLookupTable &=
-      !Args.hasArg(OPT_disable_serialization_nested_type_lookup_table);
+  Opts.EnableIncrementalDependencyVerifier |= Args.hasArg(OPT_verify_incremental_dependencies);
 
   computeImportObjCHeaderOptions();
   computeImplicitImportModuleNames();

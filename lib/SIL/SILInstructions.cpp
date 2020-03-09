@@ -417,6 +417,7 @@ ApplyInst::create(SILDebugLocation Loc, SILValue Callee, SubstitutionMap Subs,
   SILType SubstCalleeSILTy = Callee->getType().substGenericArgs(
       F.getModule(), Subs, F.getTypeExpansionContext());
   auto SubstCalleeTy = SubstCalleeSILTy.getAs<SILFunctionType>();
+  
   SILFunctionConventions Conv(SubstCalleeTy,
                               ModuleConventions.hasValue()
                                   ? ModuleConventions.getValue()
@@ -553,6 +554,7 @@ PartialApplyInst *PartialApplyInst::create(
     OnStackKind onStack) {
   SILType SubstCalleeTy = Callee->getType().substGenericArgs(
       F.getModule(), Subs, F.getTypeExpansionContext());
+
   SILType ClosureType = SILBuilder::getPartialApplyResultType(
       F.getTypeExpansionContext(), SubstCalleeTy, Args.size(), F.getModule(), {},
       CalleeConvention, onStack);
@@ -573,7 +575,7 @@ TryApplyInstBase::TryApplyInstBase(SILInstructionKind kind,
                                    SILDebugLocation loc,
                                    SILBasicBlock *normalBB,
                                    SILBasicBlock *errorBB)
-    : TermInst(kind, loc), DestBBs{{this, normalBB}, {this, errorBB}} {}
+    : TermInst(kind, loc), DestBBs{{{this, normalBB}, {this, errorBB}}} {}
 
 TryApplyInst::TryApplyInst(
     SILDebugLocation Loc, SILValue callee, SILType substCalleeTy,
@@ -603,6 +605,50 @@ TryApplyInst *TryApplyInst::create(
   return ::new (buffer) TryApplyInst(loc, callee, substCalleeTy, subs, args,
                                      typeDependentOperands,
                                      normalBB, errorBB, specializationInfo);
+}
+
+SILType DifferentiabilityWitnessFunctionInst::getDifferentiabilityWitnessType(
+    SILModule &module, DifferentiabilityWitnessFunctionKind witnessKind,
+    SILDifferentiabilityWitness *witness) {
+  auto fnTy = witness->getOriginalFunction()->getLoweredFunctionType();
+  CanGenericSignature witnessCanGenSig;
+  if (auto witnessGenSig = witness->getDerivativeGenericSignature())
+    witnessCanGenSig = witnessGenSig->getCanonicalSignature();
+  auto *parameterIndices = witness->getParameterIndices();
+  auto *resultIndices = witness->getResultIndices();
+  if (auto derivativeKind = witnessKind.getAsDerivativeFunctionKind()) {
+    bool isReabstractionThunk =
+        witness->getOriginalFunction()->isThunk() == IsReabstractionThunk;
+    auto diffFnTy = fnTy->getAutoDiffDerivativeFunctionType(
+        parameterIndices, *resultIndices->begin(), *derivativeKind,
+        module.Types, LookUpConformanceInModule(module.getSwiftModule()),
+        witnessCanGenSig, isReabstractionThunk);
+    return SILType::getPrimitiveObjectType(diffFnTy);
+  }
+  assert(witnessKind == DifferentiabilityWitnessFunctionKind::Transpose);
+  auto transposeFnTy = fnTy->getAutoDiffTransposeFunctionType(
+      parameterIndices, module.Types,
+      LookUpConformanceInModule(module.getSwiftModule()), witnessCanGenSig);
+  return SILType::getPrimitiveObjectType(transposeFnTy);
+}
+
+DifferentiabilityWitnessFunctionInst::DifferentiabilityWitnessFunctionInst(
+    SILModule &module, SILDebugLocation debugLoc,
+    DifferentiabilityWitnessFunctionKind witnessKind,
+    SILDifferentiabilityWitness *witness, Optional<SILType> functionType)
+    : InstructionBase(debugLoc, functionType
+                                    ? *functionType
+                                    : getDifferentiabilityWitnessType(
+                                          module, witnessKind, witness)),
+      witnessKind(witnessKind), witness(witness),
+      hasExplicitFunctionType(functionType) {
+  assert(witness && "Differentiability witness must not be null");
+#ifndef NDEBUG
+  if (functionType.hasValue()) {
+    assert(module.getStage() == SILStage::Lowered &&
+           "Explicit type is valid only in lowered SIL");
+  }
+#endif
 }
 
 FunctionRefBaseInst::FunctionRefBaseInst(SILInstructionKind Kind,
@@ -1217,13 +1263,13 @@ bool TermInst::isProgramTerminating() const {
   llvm_unreachable("Unhandled TermKind in switch.");
 }
 
-TermInst::SuccessorBlockArgumentsListTy
-TermInst::getSuccessorBlockArguments() const {
-  function_ref<SILPhiArgumentArrayRef(const SILSuccessor &)> op;
-  op = [](const SILSuccessor &succ) -> SILPhiArgumentArrayRef {
-    return succ.getBB()->getSILPhiArguments();
+TermInst::SuccessorBlockArgumentListTy
+TermInst::getSuccessorBlockArgumentLists() const {
+  function_ref<ArrayRef<SILArgument *>(const SILSuccessor &)> op;
+  op = [](const SILSuccessor &succ) -> ArrayRef<SILArgument *> {
+    return succ.getBB()->getArguments();
   };
-  return SuccessorBlockArgumentsListTy(getSuccessors(), op);
+  return SuccessorBlockArgumentListTy(getSuccessors(), op);
 }
 
 YieldInst *YieldInst::create(SILDebugLocation loc,
@@ -1267,8 +1313,7 @@ CondBranchInst::CondBranchInst(SILDebugLocation Loc, SILValue Condition,
                                unsigned NumFalse, ProfileCounter TrueBBCount,
                                ProfileCounter FalseBBCount)
     : InstructionBaseWithTrailingOperands(Condition, Args, Loc),
-                                        DestBBs{{this, TrueBB, TrueBBCount},
-                                                {this, FalseBB, FalseBBCount}} {
+      DestBBs{{{this, TrueBB, TrueBBCount}, {this, FalseBB, FalseBBCount}}} {
   assert(Args.size() == (NumTrue + NumFalse) && "Invalid number of args");
   SILInstruction::Bits.CondBranchInst.NumTrueArgs = NumTrue;
   assert(SILInstruction::Bits.CondBranchInst.NumTrueArgs == NumTrue &&
@@ -1303,26 +1348,29 @@ CondBranchInst::create(SILDebugLocation Loc, SILValue Condition,
                                        TrueBBCount, FalseBBCount);
 }
 
-SILValue CondBranchInst::getArgForDestBB(const SILBasicBlock *DestBB,
-                                         const SILArgument *Arg) const {
-  return getArgForDestBB(DestBB, Arg->getIndex());
+Operand *CondBranchInst::getOperandForDestBB(const SILBasicBlock *destBlock,
+                                             const SILArgument *arg) const {
+  return getOperandForDestBB(destBlock, arg->getIndex());
 }
 
-SILValue CondBranchInst::getArgForDestBB(const SILBasicBlock *DestBB,
-                                         unsigned ArgIndex) const {
+Operand *CondBranchInst::getOperandForDestBB(const SILBasicBlock *destBlock,
+                                             unsigned argIndex) const {
   // If TrueBB and FalseBB equal, we cannot find an arg for this DestBB so
   // return an empty SILValue.
   if (getTrueBB() == getFalseBB()) {
-    assert(DestBB == getTrueBB() && "DestBB is not a target of this cond_br");
-    return SILValue();
+    assert(destBlock == getTrueBB() &&
+           "DestBB is not a target of this cond_br");
+    return nullptr;
   }
 
-  if (DestBB == getTrueBB())
-    return getAllOperands()[NumFixedOpers + ArgIndex].get();
+  auto *self = const_cast<CondBranchInst *>(this);
+  if (destBlock == getTrueBB()) {
+    return &self->getAllOperands()[NumFixedOpers + argIndex];
+  }
 
-  assert(DestBB == getFalseBB()
-         && "By process of elimination BB must be false BB");
-  return getAllOperands()[NumFixedOpers + getNumTrueArgs() + ArgIndex].get();
+  assert(destBlock == getFalseBB() &&
+         "By process of elimination BB must be false BB");
+  return &self->getAllOperands()[NumFixedOpers + getNumTrueArgs() + argIndex];
 }
 
 void CondBranchInst::swapSuccessors() {
@@ -1706,7 +1754,7 @@ DynamicMethodBranchInst::DynamicMethodBranchInst(SILDebugLocation Loc,
                                                  SILBasicBlock *NoMethodBB)
   : InstructionBase(Loc),
     Member(Member),
-    DestBBs{{this, HasMethodBB}, {this, NoMethodBB}},
+    DestBBs{{{this, HasMethodBB}, {this, NoMethodBB}}},
     Operands(this, Operand)
 {
 }
@@ -2116,6 +2164,14 @@ ConvertFunctionInst *ConvertFunctionInst::create(
            "Can not convert in between ABI incompatible function types");
   }
   return CFI;
+}
+
+bool ConvertFunctionInst::onlyConvertsSubstitutions() const {
+  auto fromType = getOperand()->getType().castTo<SILFunctionType>();
+  auto toType = getType().castTo<SILFunctionType>();
+  auto &M = getModule();
+  
+  return fromType->getUnsubstitutedType(M) == toType->getUnsubstitutedType(M);
 }
 
 ConvertEscapeToNoEscapeInst *ConvertEscapeToNoEscapeInst::create(

@@ -459,6 +459,24 @@ public:
     return SILType(getASTType().getReferenceStorageReferent(), getCategory());
   }
 
+  /// Return the reference ownership of this type if it is a reference storage
+  /// type. Otherwse, return None.
+  Optional<ReferenceOwnership> getReferenceStorageOwnership() const {
+    auto type = getASTType()->getAs<ReferenceStorageType>();
+    if (!type)
+      return None;
+    return type->getOwnership();
+  }
+
+  /// Attempt to wrap the passed in type as a type with reference ownership \p
+  /// ownership. For simplicity, we always return an address since reference
+  /// storage types may not be loadable (e.x.: weak ownership).
+  SILType getReferenceStorageType(const ASTContext &ctx,
+                                  ReferenceOwnership ownership) const {
+    auto *type = ReferenceStorageType::get(getASTType(), ownership, ctx);
+    return SILType::getPrimitiveAddressType(type->getCanonicalType());
+  }
+
   /// Transform the function type SILType by replacing all of its interface
   /// generic args with the appropriate item from the substitution.
   ///
@@ -513,6 +531,11 @@ public:
   
   /// Returns a SILType with any archetypes mapped out of context.
   SILType mapTypeOutOfContext() const;
+
+  /// Given a lowered type (but without any particular value category),
+  /// map it out of its current context.  Equivalent to
+  /// SILType::getPrimitiveObjectType(type).mapTypeOutOfContext().getASTType().
+  static CanType mapTypeOutOfContext(CanType type);
 
   /// Given two SIL types which are representations of the same type,
   /// check whether they have an abstraction difference.

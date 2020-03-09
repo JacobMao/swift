@@ -148,6 +148,7 @@ CONSTANT_OWNERSHIP_INST(None, WitnessMethod)
 CONSTANT_OWNERSHIP_INST(None, StoreBorrow)
 CONSTANT_OWNERSHIP_INST(None, ConvertEscapeToNoEscape)
 CONSTANT_OWNERSHIP_INST(Unowned, InitBlockStorageHeader)
+CONSTANT_OWNERSHIP_INST(None, DifferentiabilityWitnessFunction)
 // TODO: It would be great to get rid of these.
 CONSTANT_OWNERSHIP_INST(Unowned, RawPointerToRef)
 CONSTANT_OWNERSHIP_INST(Unowned, ObjCProtocol)
@@ -157,7 +158,8 @@ CONSTANT_OWNERSHIP_INST(Unowned, ValueToBridgeObject)
 #define CONSTANT_OR_NONE_OWNERSHIP_INST(OWNERSHIP, INST)                       \
   ValueOwnershipKind ValueOwnershipKindClassifier::visit##INST##Inst(          \
       INST##Inst *I) {                                                         \
-    if (I->getType().isTrivial(*I->getFunction())) {                           \
+    if (I->getType().isTrivial(*I->getFunction()) ||                           \
+        I->getType().isAddress()) {                                            \
       return ValueOwnershipKind::None;                                         \
     }                                                                          \
     return ValueOwnershipKind::OWNERSHIP;                                      \
@@ -173,6 +175,12 @@ CONSTANT_OR_NONE_OWNERSHIP_INST(Guaranteed, TupleExtract)
 CONSTANT_OR_NONE_OWNERSHIP_INST(Guaranteed, OpenExistentialValue)
 CONSTANT_OR_NONE_OWNERSHIP_INST(Guaranteed, OpenExistentialBoxValue)
 CONSTANT_OR_NONE_OWNERSHIP_INST(Owned, UnconditionalCheckedCastValue)
+
+// Given an owned value, mark_uninitialized always forwards an owned value since
+// we want to make sure that all destroys of that value must come through the
+// mark_uninitialized (which will happen due to mark_uninitialized consuming the
+// value).
+CONSTANT_OR_NONE_OWNERSHIP_INST(Owned, MarkUninitialized)
 
 // unchecked_bitwise_cast is a bitwise copy. It produces a trivial or unowned
 // result.
@@ -249,7 +257,6 @@ FORWARDING_OWNERSHIP_INST(Tuple)
 FORWARDING_OWNERSHIP_INST(UncheckedRefCast)
 FORWARDING_OWNERSHIP_INST(UnconditionalCheckedCast)
 FORWARDING_OWNERSHIP_INST(Upcast)
-FORWARDING_OWNERSHIP_INST(MarkUninitialized)
 FORWARDING_OWNERSHIP_INST(UncheckedEnumData)
 FORWARDING_OWNERSHIP_INST(SelectEnum)
 FORWARDING_OWNERSHIP_INST(Enum)
@@ -312,7 +319,7 @@ ValueOwnershipKind ValueOwnershipKindClassifier::visitApplyInst(ApplyInst *ai) {
   // Otherwise, map our results to their ownership kinds and then merge them!
   auto resultOwnershipKinds =
       makeTransformRange(results, [&](const SILResultInfo &info) {
-        return info.getOwnershipKind(*f);
+        return info.getOwnershipKind(*f, ai->getSubstCalleeType());
       });
   auto mergedOwnershipKind = ValueOwnershipKind::merge(resultOwnershipKinds);
   if (!mergedOwnershipKind) {
@@ -515,6 +522,7 @@ CONSTANT_OWNERSHIP_BUILTIN(None, OnceWithContext)
 CONSTANT_OWNERSHIP_BUILTIN(None, TSanInoutAccess)
 CONSTANT_OWNERSHIP_BUILTIN(None, Swift3ImplicitObjCEntrypoint)
 CONSTANT_OWNERSHIP_BUILTIN(None, PoundAssert)
+CONSTANT_OWNERSHIP_BUILTIN(None, TypePtrAuthDiscriminator)
 CONSTANT_OWNERSHIP_BUILTIN(None, GlobalStringTablePointer)
 
 #undef CONSTANT_OWNERSHIP_BUILTIN
@@ -541,7 +549,6 @@ UNOWNED_OR_NONE_DEPENDING_ON_RESULT(ZeroInitializer)
       BuiltinInst *BI, StringRef Attr) { \
     llvm_unreachable("builtin should have been lowered in SILGen"); \
   }
-
 #include "swift/AST/Builtins.def"
 
 ValueOwnershipKind

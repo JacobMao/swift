@@ -492,7 +492,7 @@ public:
   SILFunction &getFunction() { return F; }
   SILModule &getModule() { return F.getModule(); }
   SILGenBuilder &getBuilder() { return B; }
-  SILOptions &getOptions() { return getModule().getOptions(); }
+  const SILOptions &getOptions() { return getModule().getOptions(); }
 
   // Returns the type expansion context for types in this function.
   TypeExpansionContext getTypeExpansionContext() {
@@ -530,6 +530,13 @@ public:
     return F.getTypeLowering(type);
   }
 
+  SILType getSILInterfaceType(SILParameterInfo param) const {
+    return silConv.getSILType(param, CanSILFunctionType());
+  }
+  SILType getSILInterfaceType(SILResultInfo result) const {
+    return silConv.getSILType(result, CanSILFunctionType());
+  }
+
   SILType getSILType(SILParameterInfo param, CanSILFunctionType fnTy) const {
     return silConv.getSILType(param, fnTy);
   }
@@ -557,6 +564,9 @@ public:
   Optional<SILAccessEnforcement> getUnknownEnforcement(VarDecl *var = nullptr);
 
   SourceManager &getSourceManager() { return SGM.M.getASTContext().SourceMgr; }
+  std::string getMagicFileString(SourceLoc loc);
+  StringRef getMagicFilePathString(SourceLoc loc);
+  StringRef getMagicFunctionString();
 
   /// Push a new debug scope and set its parent pointer.
   void enterDebugScope(SILLocation Loc) {
@@ -828,13 +838,12 @@ public:
   /// Create (but do not emit) the epilog branch, and save the
   /// current cleanups depth as the destination for return statement branches.
   ///
-  /// \param returnType  If non-null, the epilog block will be created with an
-  ///                    argument of this type to receive the return value for
-  ///                    the function.
+  /// \param hasDirectResults  If true, the epilog block will be created with
+  ///                    arguments for each direct result of this function.
   /// \param isThrowing  If true, create an error epilog block.
   /// \param L           The SILLocation which should be associated with
   ///                    cleanup instructions.
-  void prepareEpilog(Type returnType, bool isThrowing, CleanupLocation L);
+  void prepareEpilog(bool hasDirectResults, bool isThrowing, CleanupLocation L);
   void prepareRethrowEpilog(CleanupLocation l);
   void prepareCoroutineUnwindEpilog(CleanupLocation l);
   
@@ -1335,6 +1344,11 @@ public:
                                       const TypeLowering &lowering);
   ManagedValue emitManagedBeginBorrow(SILLocation loc, SILValue v);
 
+  ManagedValue
+  emitManagedBorrowedRValueWithCleanup(SILValue borrowedValue,
+                                       const TypeLowering &lowering);
+  ManagedValue emitManagedBorrowedRValueWithCleanup(SILValue borrowedValue);
+
   ManagedValue emitManagedBorrowedRValueWithCleanup(SILValue original,
                                                     SILValue borrowedValue);
   ManagedValue emitManagedBorrowedRValueWithCleanup(
@@ -1500,6 +1514,7 @@ public:
   RValue emitApplyOfPropertyWrapperBackingInitializer(
       SILLocation loc,
       VarDecl *var,
+      SubstitutionMap subs,
       RValue &&originalValue,
       SGFContext C = SGFContext());
 

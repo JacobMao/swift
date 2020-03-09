@@ -17,6 +17,7 @@
 #ifndef SWIFT_SIL_INSTRUCTION_H
 #define SWIFT_SIL_INSTRUCTION_H
 
+#include "swift/AST/AutoDiff.h"
 #include "swift/AST/Builtins.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericSignature.h"
@@ -42,6 +43,7 @@
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
 #include "llvm/Support/TrailingObjects.h"
+#include <array>
 
 namespace swift {
 
@@ -60,6 +62,7 @@ class SILBasicBlock;
 class SILBuilder;
 class SILDebugLocation;
 class SILDebugScope;
+class SILDifferentiabilityWitness;
 class SILFunction;
 class SILGlobalVariable;
 class SILInstructionResultArray;
@@ -318,7 +321,7 @@ class SILInstruction
 
   SILInstruction() = delete;
   void operator=(const SILInstruction &) = delete;
-  void operator delete(void *Ptr, size_t) SWIFT_DELETE_OPERATOR_DELETED
+  void operator delete(void *Ptr, size_t) = delete;
 
   /// Check any special state of instructions that are not represented in the
   /// instructions operands/type.
@@ -799,7 +802,7 @@ public:
   SILModule &getModule() const { return SILInstruction::getModule(); }
   SILInstructionKind getKind() const { return SILInstruction::getKind(); }
 
-  void operator delete(void *Ptr, size_t) SWIFT_DELETE_OPERATOR_DELETED
+  void operator delete(void *Ptr, size_t) = delete;
 
   ValueKind getValueKind() const {
     return ValueBase::getKind();
@@ -950,7 +953,7 @@ protected:
       : SILInstruction(kind, loc) {}
 
 public:
-  void operator delete(void *Ptr, size_t)SWIFT_DELETE_OPERATOR_DELETED;
+  void operator delete(void *Ptr, size_t) = delete;
 
   MultipleValueInstruction *clone(SILInstruction *insertPt = nullptr) {
     return cast<MultipleValueInstruction>(SILInstruction::clone(insertPt));
@@ -998,7 +1001,7 @@ class MultipleValueInstructionTrailingObjects<Derived, DerivedResult,
                                       MultipleValueInstruction *,
                                       DerivedResult,
                                       FinalOtherTrailingTypes...> {
-  static_assert(LLVM_IS_FINAL(DerivedResult),
+  static_assert(std::is_final<DerivedResult>(),
                 "Expected DerivedResult to be final");
   static_assert(
       std::is_base_of<MultipleValueInstructionResult, DerivedResult>::value,
@@ -1441,7 +1444,18 @@ public:
     }
   }
 
+  /// Set to true that this alloc_stack contains a value whose lifetime can not
+  /// be ascertained from uses.
+  ///
+  /// As an example if an alloc_stack is known to be only conditionally
+  /// initialized.
   void setDynamicLifetime() { dynamicLifetime = true; }
+
+  /// Returns true if the alloc_stack's initialization can not be ascertained
+  /// from uses directly (so should be treated conservatively).
+  ///
+  /// An example of an alloc_stack with dynamic lifetime is an alloc_stack that
+  /// is conditionally initialized.
   bool hasDynamicLifetime() const { return dynamicLifetime; }
 
   /// Return the debug variable information attached to this instruction.
@@ -1872,6 +1886,7 @@ public:
   /// The operand number of the first argument.
   static unsigned getArgumentOperandNumber() { return NumStaticOperands; }
 
+  Operand *getCalleeOperand() { return &getAllOperands()[Callee]; }
   const Operand *getCalleeOperand() const { return &getAllOperands()[Callee]; }
   SILValue getCallee() const { return getCalleeOperand()->get(); }
 
@@ -1930,6 +1945,11 @@ public:
   SILType getSubstCalleeSILType() const {
     return SubstCalleeType;
   }
+  
+  void setSubstCalleeType(CanSILFunctionType t) {
+    SubstCalleeType = SILType::getPrimitiveObjectType(t);
+  }
+  
   SILFunctionConventions getSubstCalleeConv() const {
     return SILFunctionConventions(getSubstCalleeType(), this->getModule());
   }
@@ -4311,6 +4331,11 @@ public:
   bool withoutActuallyEscaping() const {
     return SILInstruction::Bits.ConvertFunctionInst.WithoutActuallyEscaping;
   }
+            
+  /// Returns `true` if the function conversion is between types with the same
+  /// argument and return types, as well as all other attributes, after substitution,
+  /// such as converting `$<A, B> in (A) -> B for <Int, String>` to `(Int) -> String`.
+  bool onlyConvertsSubstitutions() const;
 };
 
 /// ConvertEscapeToNoEscapeInst - Change the type of a escaping function value
@@ -6998,13 +7023,13 @@ public:
     });
   }
 
-  using SuccessorBlockArgumentsListTy =
-      TransformRange<ConstSuccessorListTy, function_ref<SILPhiArgumentArrayRef(
+  using SuccessorBlockArgumentListTy =
+      TransformRange<ConstSuccessorListTy, function_ref<ArrayRef<SILArgument *>(
                                                const SILSuccessor &)>>;
 
   /// Return the range of Argument arrays for each successor of this
   /// block.
-  SuccessorBlockArgumentsListTy getSuccessorBlockArguments() const;
+  SuccessorBlockArgumentListTy getSuccessorBlockArgumentLists() const;
 
   using SuccessorBlockListTy =
       TransformRange<SuccessorListTy,
@@ -7041,6 +7066,30 @@ public:
   bool isProgramTerminating() const;
 
   TermKind getTermKind() const { return TermKind(getKind()); }
+
+  /// Returns true if this is a transformation terminator.
+  bool isTransformationTerminator() const {
+    switch (getTermKind()) {
+    case TermKind::UnwindInst:
+    case TermKind::UnreachableInst:
+    case TermKind::ReturnInst:
+    case TermKind::ThrowInst:
+    case TermKind::YieldInst:
+    case TermKind::TryApplyInst:
+    case TermKind::BranchInst:
+    case TermKind::CondBranchInst:
+    case TermKind::SwitchValueInst:
+    case TermKind::SwitchEnumAddrInst:
+    case TermKind::DynamicMethodBranchInst:
+    case TermKind::CheckedCastAddrBranchInst:
+    case TermKind::CheckedCastValueBranchInst:
+      return false;
+    case TermKind::SwitchEnumInst:
+    case TermKind::CheckedCastBranchInst:
+      return true;
+    }
+    llvm_unreachable("Covered switch isn't covered.");
+  }
 };
 
 /// UnreachableInst - Position in the code which would be undefined to reach.
@@ -7138,12 +7187,12 @@ class YieldInst final
                                                YieldInst, TermInst> {
   friend SILBuilder;
 
-  SILSuccessor DestBBs[2];
+  std::array<SILSuccessor, 2> DestBBs;
 
   YieldInst(SILDebugLocation loc, ArrayRef<SILValue> yieldedValues,
             SILBasicBlock *normalBB, SILBasicBlock *unwindBB)
     : InstructionBaseWithTrailingOperands(yieldedValues, loc),
-      DestBBs{{this, normalBB}, {this, unwindBB}} {}
+      DestBBs{{{this, normalBB}, {this, unwindBB}}} {}
 
   static YieldInst *create(SILDebugLocation loc,
                            ArrayRef<SILValue> yieldedValues,
@@ -7253,7 +7302,8 @@ public:
     FalseIdx
   };
 private:
-  SILSuccessor DestBBs[2];
+  std::array<SILSuccessor, 2> DestBBs;
+
   /// The number of arguments for the True branch.
   unsigned getNumTrueArgs() const {
     return SILInstruction::Bits.CondBranchInst.NumTrueArgs;
@@ -7370,15 +7420,35 @@ public:
            OpIndex <= Operands.back().getOperandNumber();
   }
 
+  /// Returns the operand on the cond_br terminator associated with the value
+  /// that will be passed to DestBB in A.
+  Operand *getOperandForDestBB(const SILBasicBlock *DestBB,
+                               const SILArgument *A) const;
+
+  /// Returns the operand on the cond_br terminator associated with the value
+  /// that will be passed as the \p Index argument to DestBB.
+  Operand *getOperandForDestBB(const SILBasicBlock *DestBB,
+                               unsigned ArgIndex) const;
+
   /// Returns the argument on the cond_br terminator that will be passed to
   /// DestBB in A.
   SILValue getArgForDestBB(const SILBasicBlock *DestBB,
-                           const SILArgument *A) const;
+                           const SILArgument *A) const {
+    if (auto *op = getOperandForDestBB(DestBB, A)) {
+      return op->get();
+    }
+    return SILValue();
+  }
 
   /// Returns the argument on the cond_br terminator that will be passed as the
   /// \p Index argument to DestBB.
   SILValue getArgForDestBB(const SILBasicBlock *DestBB,
-                           unsigned ArgIndex) const;
+                           unsigned ArgIndex) const {
+    if (auto *op = getOperandForDestBB(DestBB, ArgIndex)) {
+      return op->get();
+    }
+    return SILValue();
+  }
 
   /// Return the SILPhiArgument from either the true or false destination for
   /// the given operand.
@@ -7638,7 +7708,7 @@ class DynamicMethodBranchInst
 
   SILDeclRef Member;
 
-  SILSuccessor DestBBs[2];
+  std::array<SILSuccessor, 2> DestBBs;
 
   /// The operand.
   FixedOperandList<1> Operands;
@@ -7686,7 +7756,7 @@ class CheckedCastBranchInst final:
   CanType DestFormalTy;
   bool IsExact;
 
-  SILSuccessor DestBBs[2];
+  std::array<SILSuccessor, 2> DestBBs;
 
   CheckedCastBranchInst(SILDebugLocation DebugLoc, bool IsExact,
                         SILValue Operand,
@@ -7698,8 +7768,8 @@ class CheckedCastBranchInst final:
                                                       TypeDependentOperands),
         DestLoweredTy(DestLoweredTy),
         DestFormalTy(DestFormalTy),
-        IsExact(IsExact), DestBBs{{this, SuccessBB, Target1Count},
-                                  {this, FailureBB, Target2Count}} {}
+        IsExact(IsExact), DestBBs{{{this, SuccessBB, Target1Count},
+                                   {this, FailureBB, Target2Count}}} {}
 
   static CheckedCastBranchInst *
   create(SILDebugLocation DebugLoc, bool IsExact, SILValue Operand,
@@ -7746,7 +7816,7 @@ class CheckedCastValueBranchInst final
   SILType DestLoweredTy;
   CanType DestFormalTy;
 
-  SILSuccessor DestBBs[2];
+  std::array<SILSuccessor, 2> DestBBs;
 
   CheckedCastValueBranchInst(SILDebugLocation DebugLoc,
                              SILValue Operand, CanType SourceFormalTy,
@@ -7757,7 +7827,7 @@ class CheckedCastValueBranchInst final
                                                       TypeDependentOperands),
         SourceFormalTy(SourceFormalTy),
         DestLoweredTy(DestLoweredTy), DestFormalTy(DestFormalTy),
-        DestBBs{{this, SuccessBB}, {this, FailureBB}} {}
+        DestBBs{{{this, SuccessBB}, {this, FailureBB}}} {}
 
   static CheckedCastValueBranchInst *
   create(SILDebugLocation DebugLoc,
@@ -7791,7 +7861,7 @@ class CheckedCastAddrBranchInst
   CastConsumptionKind ConsumptionKind;
 
   FixedOperandList<2> Operands;
-  SILSuccessor DestBBs[2];
+  std::array<SILSuccessor, 2> DestBBs;
 
   CanType SourceType;
   CanType TargetType;
@@ -7803,8 +7873,8 @@ class CheckedCastAddrBranchInst
                             ProfileCounter Target1Count,
                             ProfileCounter Target2Count)
       : InstructionBase(DebugLoc), ConsumptionKind(consumptionKind),
-        Operands{this, src, dest}, DestBBs{{this, successBB, Target1Count},
-                                           {this, failureBB, Target2Count}},
+        Operands{this, src, dest}, DestBBs{{{this, successBB, Target1Count},
+                                            {this, failureBB, Target2Count}}},
         SourceType(srcType), TargetType(targetType) {
     assert(ConsumptionKind != CastConsumptionKind::BorrowAlways &&
            "BorrowAlways is not supported on addresses");
@@ -7856,7 +7926,7 @@ public:
     ErrorIdx
   };
 private:
-  SILSuccessor DestBBs[2];
+  std::array<SILSuccessor, 2> DestBBs;
 
 protected:
   TryApplyInstBase(SILInstructionKind valueKind, SILDebugLocation Loc,
@@ -7903,6 +7973,40 @@ class TryApplyInst final
          SILBasicBlock *normalBB, SILBasicBlock *errorBB, SILFunction &F,
          SILOpenedArchetypesState &OpenedArchetypes,
          const GenericSpecializationInformation *SpecializationInfo);
+};
+
+class DifferentiabilityWitnessFunctionInst
+    : public InstructionBase<
+          SILInstructionKind::DifferentiabilityWitnessFunctionInst,
+          SingleValueInstruction> {
+private:
+  friend SILBuilder;
+  /// The differentiability witness function kind.
+  DifferentiabilityWitnessFunctionKind witnessKind;
+  /// The referenced SIL differentiability witness.
+  SILDifferentiabilityWitness *witness;
+  /// Whether the instruction has an explicit function type.
+  bool hasExplicitFunctionType;
+
+  static SILType getDifferentiabilityWitnessType(
+      SILModule &module, DifferentiabilityWitnessFunctionKind witnessKind,
+      SILDifferentiabilityWitness *witness);
+
+public:
+  /// Note: explicit function type may be specified only in lowered SIL.
+  DifferentiabilityWitnessFunctionInst(
+      SILModule &module, SILDebugLocation loc,
+      DifferentiabilityWitnessFunctionKind witnessKind,
+      SILDifferentiabilityWitness *witness, Optional<SILType> FunctionType);
+
+  DifferentiabilityWitnessFunctionKind getWitnessKind() const {
+    return witnessKind;
+  }
+  SILDifferentiabilityWitness *getWitness() const { return witness; }
+  bool getHasExplicitFunctionType() const { return hasExplicitFunctionType; }
+
+  ArrayRef<Operand> getAllOperands() const { return {}; }
+  MutableArrayRef<Operand> getAllOperands() { return {}; }
 };
 
 // This is defined out of line to work around the fact that this depends on
