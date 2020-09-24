@@ -29,6 +29,7 @@
 #include <memory>
 
 namespace llvm {
+  class raw_pwrite_stream;
   class GlobalVariable;
   class MemoryBuffer;
   class Module;
@@ -148,7 +149,9 @@ namespace swift {
   ///
   /// \returns A well-formed type on success, or an \c ErrorType.
   Type performTypeResolution(TypeRepr *TyR, ASTContext &Ctx, bool isSILMode,
-                             bool isSILType, GenericEnvironment *GenericEnv,
+                             bool isSILType,
+                             GenericEnvironment *GenericEnv,
+                             GenericParamList *GenericParams,
                              DeclContext *DC, bool ProduceDiagnostics = true);
 
   /// Expose TypeChecker's handling of GenericParamList to SIL parsing.

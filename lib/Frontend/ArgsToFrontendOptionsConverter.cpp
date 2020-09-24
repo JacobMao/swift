@@ -71,6 +71,8 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.EmitVerboseSIL |= Args.hasArg(OPT_emit_verbose_sil);
   Opts.EmitSortedSIL |= Args.hasArg(OPT_emit_sorted_sil);
+  Opts.PrintFullConvention |=
+      Args.hasArg(OPT_experimental_print_full_convention);
 
   Opts.EnableTesting |= Args.hasArg(OPT_enable_testing);
   Opts.EnablePrivateImports |= Args.hasArg(OPT_enable_private_imports);
@@ -87,6 +89,8 @@ bool ArgsToFrontendOptionsConverter::convert(
   }
 
   Opts.DisableImplicitModules |= Args.hasArg(OPT_disable_implicit_swift_modules);
+
+  Opts.ImportPrescan |= Args.hasArg(OPT_import_prescan);
 
   // Always track system dependencies when scanning dependencies.
   if (const Arg *ModeArg = Args.getLastArg(OPT_modes_Group)) {
@@ -143,11 +147,22 @@ bool ArgsToFrontendOptionsConverter::convert(
     Opts.InputsAndOutputs = std::move(inputsAndOutputs).getValue();
   }
 
+  if (Args.hasArg(OPT_parse_sil) || Opts.InputsAndOutputs.shouldTreatAsSIL()) {
+    Opts.InputMode = FrontendOptions::ParseInputMode::SIL;
+  } else if (Opts.InputsAndOutputs.shouldTreatAsModuleInterface()) {
+    Opts.InputMode = FrontendOptions::ParseInputMode::SwiftModuleInterface;
+  } else if (Args.hasArg(OPT_parse_as_library)) {
+    Opts.InputMode = FrontendOptions::ParseInputMode::SwiftLibrary;
+  } else {
+    Opts.InputMode = FrontendOptions::ParseInputMode::Swift;
+  }
+
   if (Opts.RequestedAction == FrontendOptions::ActionType::NoneAction) {
     Opts.RequestedAction = determineRequestedAction(Args);
   }
 
-  if (Opts.RequestedAction == FrontendOptions::ActionType::CompileModuleFromInterface) {
+  if (Opts.RequestedAction == FrontendOptions::ActionType::CompileModuleFromInterface ||
+      Opts.RequestedAction == FrontendOptions::ActionType::TypecheckModuleFromInterface) {
     // The situations where we use this action, e.g. explicit module building and
     // generating prebuilt module cache, don't need synchronization. We should avoid
     // using lock files for them.
@@ -162,7 +177,7 @@ bool ArgsToFrontendOptionsConverter::convert(
     return true;
   }
 
-  if (setUpInputKindAndImmediateArgs())
+  if (setUpImmediateArgs())
     return true;
 
   if (computeModuleName())
@@ -391,11 +406,13 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
     return FrontendOptions::ActionType::Immediate;
   if (Opt.matches(OPT_compile_module_from_interface))
     return FrontendOptions::ActionType::CompileModuleFromInterface;
+  if (Opt.matches(OPT_typecheck_module_from_interface))
+    return FrontendOptions::ActionType::TypecheckModuleFromInterface;
 
   llvm_unreachable("Unhandled mode option");
 }
 
-bool ArgsToFrontendOptionsConverter::setUpInputKindAndImmediateArgs() {
+bool ArgsToFrontendOptionsConverter::setUpImmediateArgs() {
   using namespace options;
   bool treatAsSIL =
       Args.hasArg(OPT_parse_sil) || Opts.InputsAndOutputs.shouldTreatAsSIL();
@@ -403,8 +420,7 @@ bool ArgsToFrontendOptionsConverter::setUpInputKindAndImmediateArgs() {
   if (Opts.InputsAndOutputs.verifyInputs(
           Diags, treatAsSIL,
           Opts.RequestedAction == FrontendOptions::ActionType::REPL,
-          (Opts.RequestedAction == FrontendOptions::ActionType::NoneAction ||
-           Opts.RequestedAction == FrontendOptions::ActionType::PrintVersion))){
+          !FrontendOptions::doesActionRequireInputs(Opts.RequestedAction))) {
     return true;
   }
   if (Opts.RequestedAction == FrontendOptions::ActionType::Immediate) {
@@ -416,17 +432,6 @@ bool ArgsToFrontendOptionsConverter::setUpInputKindAndImmediateArgs() {
       }
     }
   }
-
-  if (treatAsSIL)
-    Opts.InputKind = InputFileKind::SIL;
-  else if (Opts.InputsAndOutputs.shouldTreatAsLLVM())
-    Opts.InputKind = InputFileKind::LLVM;
-  else if (Opts.InputsAndOutputs.shouldTreatAsModuleInterface())
-    Opts.InputKind = InputFileKind::SwiftModuleInterface;
-  else if (Args.hasArg(OPT_parse_as_library))
-    Opts.InputKind = InputFileKind::SwiftLibrary;
-  else
-    Opts.InputKind = InputFileKind::Swift;
 
   return false;
 }
@@ -560,6 +565,11 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
       (Opts.InputsAndOutputs.hasModuleInterfaceOutputPath() ||
        Opts.InputsAndOutputs.hasPrivateModuleInterfaceOutputPath())) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_interface);
+    return true;
+  }
+  if (!FrontendOptions::canActionEmitModuleSummary(Opts.RequestedAction) &&
+      Opts.InputsAndOutputs.hasModuleSummaryOutputPath()) {
+    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_module_summary);
     return true;
   }
   return false;

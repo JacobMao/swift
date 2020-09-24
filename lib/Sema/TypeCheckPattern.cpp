@@ -119,10 +119,9 @@ lookupUnqualifiedEnumMemberElement(DeclContext *DC, DeclNameRef name,
   // FIXME: We should probably pay attention to argument labels someday.
   name = name.withoutArgumentLabels();
 
-  auto lookupOptions = defaultUnqualifiedLookupOptions;
-  lookupOptions |= NameLookupFlags::KnownPrivate;
   auto lookup =
-      TypeChecker::lookupUnqualified(DC, name, SourceLoc(), lookupOptions);
+      TypeChecker::lookupUnqualified(DC, name, UseLoc,
+                                     defaultUnqualifiedLookupOptions);
   return filterForEnumElement(DC, UseLoc,
                               /*unqualifiedLookup=*/true, lookup);
 }
@@ -446,18 +445,12 @@ public:
   // Unresolved member syntax '.Element' forms an EnumElement pattern. The
   // element will be resolved when we type-check the pattern.
   Pattern *visitUnresolvedMemberExpr(UnresolvedMemberExpr *ume) {
-    // If the unresolved member has an argument, turn it into a subpattern.
-    Pattern *subPattern = nullptr;
-    if (auto arg = ume->getArgument()) {
-      subPattern = getSubExprPattern(arg);
-    }
-    
     if (ume->getName().getBaseName().isSpecial())
       return nullptr;
 
     return new (Context)
         EnumElementPattern(ume->getDotLoc(), ume->getNameLoc(), ume->getName(),
-                           subPattern, ume);
+                           nullptr, ume);
   }
   
   // Member syntax 'T.Element' forms a pattern if 'T' is an enum and the
@@ -546,6 +539,18 @@ public:
     // Let it be diagnosed as an expression.
     if (isa<UnresolvedSpecializeExpr>(ce->getFn()))
       return nullptr;
+
+    if (isa<UnresolvedMemberExpr>(ce->getFn())) {
+      auto *P = visit(ce->getFn());
+      if (!P)
+        return nullptr;
+
+      auto *EEP = cast<EnumElementPattern>(P);
+      EEP->setSubPattern(getSubExprPattern(ce->getArg()));
+      EEP->setUnresolvedOriginalExpr(ce);
+
+      return P;
+    }
 
     SmallVector<ComponentIdentTypeRepr *, 2> components;
     if (!ExprToIdentTypeRepr(components, Context).visit(ce->getFn()))

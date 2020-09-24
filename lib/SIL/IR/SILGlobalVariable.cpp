@@ -58,7 +58,8 @@ SILGlobalVariable::SILGlobalVariable(SILModule &Module, SILLinkage Linkage,
 }
 
 SILGlobalVariable::~SILGlobalVariable() {
-  getModule().GlobalVariableMap.erase(Name);
+  StaticInitializerBlock.dropAllReferences();
+  StaticInitializerBlock.clearStaticInitializerBlock(Module);
 }
 
 /// Get this global variable's fragile attribute.
@@ -272,7 +273,7 @@ SILFunction *swift::findInitializer(SILFunction *AddrF,
   if (!CallToOnce)
     return nullptr;
   SILFunction *callee = getCalleeOfOnceCall(CallToOnce);
-  if (!callee->getName().startswith("globalinit_"))
+  if (!callee->isGlobalInitOnceFunction())
     return nullptr;
   return callee;
 }

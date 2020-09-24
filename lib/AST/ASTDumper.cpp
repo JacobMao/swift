@@ -18,6 +18,7 @@
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Initializer.h"
@@ -285,10 +286,10 @@ StringRef swift::getReadWriteImplKindName(ReadWriteImplKind kind) {
     return "materialize_to_temporary";
   case ReadWriteImplKind::Modify:
     return "modify_coroutine";
-  case ReadWriteImplKind::StoredWithSimpleDidSet:
-    return "stored_simple_didset";
-  case ReadWriteImplKind::InheritedWithSimpleDidSet:
-    return "inherited_simple_didset";
+  case ReadWriteImplKind::StoredWithDidSet:
+    return "stored_with_didset";
+  case ReadWriteImplKind::InheritedWithDidSet:
+    return "inherited_with_didset";
   }
   llvm_unreachable("bad kind");
 }
@@ -585,6 +586,9 @@ namespace {
       if (D->isImplicit())
         PrintWithColorRAII(OS, DeclModifierColor) << " implicit";
 
+      if (D->isHoisted())
+        PrintWithColorRAII(OS, DeclModifierColor) << " hoisted";
+
       auto R = D->getSourceRange();
       if (R.isValid()) {
         PrintWithColorRAII(OS, RangeColor) << " range=";
@@ -615,11 +619,11 @@ namespace {
         OS << " kind=" << getImportKindString(ID->getImportKind());
 
       OS << " '";
-      interleave(ID->getFullAccessPath(),
-                 [&](const ImportDecl::AccessPathElement &Elem) {
-                   OS << Elem.Item;
-                 },
-                 [&] { OS << '.'; });
+      llvm::interleave(ID->getImportPath(),
+                       [&](const ImportPath::Element &Elem) {
+                         OS << Elem.Item;
+                       },
+                       [&] { OS << '.'; });
       OS << "')";
     }
 
@@ -838,8 +842,6 @@ namespace {
       printCommon(VD, "var_decl");
       if (VD->isLet())
         PrintWithColorRAII(OS, DeclModifierColor) << " let";
-      if (VD->hasNonPatternBindingInit())
-        PrintWithColorRAII(OS, DeclModifierColor) << " non_pattern_init";
       if (VD->getAttrs().hasAttribute<LazyAttr>())
         PrintWithColorRAII(OS, DeclModifierColor) << " lazy";
       printStorageImpl(VD);
@@ -950,6 +952,16 @@ namespace {
       if (!D->getCaptureInfo().isTrivial()) {
         OS << " ";
         D->getCaptureInfo().print(OS);
+      }
+
+      if (auto fac = D->getForeignAsyncConvention()) {
+        OS << " foreign_async=";
+        if (auto type = fac->completionHandlerType())
+          type.print(OS);
+        OS << ",completion_handler_param="
+           << fac->completionHandlerParamIndex();
+        if (auto errorParamIndex = fac->completionHandlerErrorParamIndex())
+          OS << ",error_param=" << *errorParamIndex;
       }
 
       if (auto fec = D->getForeignErrorConvention()) {
@@ -2108,11 +2120,8 @@ public:
   void visitUnresolvedMemberExpr(UnresolvedMemberExpr *E) {
     printCommon(E, "unresolved_member_expr")
       << " name='" << E->getName() << "'";
-    printArgumentLabels(E->getArgumentLabels());
-    if (E->getArgument()) {
-      OS << '\n';
-      printRec(E->getArgument());
-    }
+    PrintWithColorRAII(OS, ExprModifierColor)
+      << " function_ref=" << getFunctionRefKindStr(E->getFunctionRefKind());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
   void visitDotSelfExpr(DotSelfExpr *E) {
@@ -2135,7 +2144,12 @@ public:
     printRec(E->getSubExpr());
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
-
+  void visitUnresolvedMemberChainResultExpr(UnresolvedMemberChainResultExpr *E){
+    printCommon(E, "unresolved_member_chain_expr");
+    OS << '\n';
+    printRec(E->getSubExpr());
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
   void visitTupleExpr(TupleExpr *E) {
     printCommon(E, "tuple_expr");
     if (E->hasTrailingClosure())
@@ -3496,6 +3510,20 @@ namespace {
 
     TRIVIAL_TYPE_PRINTER(Unresolved, unresolved)
 
+    void visitHoleType(HoleType *T, StringRef label) {
+      printCommon(label, "hole_type");
+      auto originator = T->getOriginator();
+      if (auto *typeVar = originator.dyn_cast<TypeVariableType *>()) {
+        printRec("type_variable", typeVar);
+      } else if (auto *VD = originator.dyn_cast<VarDecl *>()) {
+        VD->dumpRef(PrintWithColorRAII(OS, DeclColor).getOS());
+      } else {
+        printRec("dependent_member_type",
+                 originator.get<DependentMemberType *>());
+      }
+      PrintWithColorRAII(OS, ParenthesisColor) << ')';
+    }
+
     void visitBuiltinIntegerType(BuiltinIntegerType *T, StringRef label) {
       printCommon(label, "builtin_integer_type");
       if (T->isFixedWidth())
@@ -3767,7 +3795,9 @@ namespace {
       if (!T->getClangTypeInfo().empty()) {
         std::string s;
         llvm::raw_string_ostream os(s);
-        T->getClangTypeInfo().dump(os);
+        auto &ctx = T->getASTContext().getClangModuleLoader()
+          ->getClangASTContext();
+        T->getClangTypeInfo().dump(os, ctx);
         printField("clang_type", os.str());
       }
       printAnyFunctionParams(T->getParams(), "input");
@@ -3812,6 +3842,14 @@ namespace {
       OS << '\n';
       T->getInvocationSubstitutions().dump(OS, SubstitutionMap::DumpStyle::Full,
                                            Indent+2);
+      if (!T->getClangTypeInfo().empty()) {
+        std::string s;
+        llvm::raw_string_ostream os(s);
+        auto &ctx =
+            T->getASTContext().getClangModuleLoader()->getClangASTContext();
+        T->getClangTypeInfo().dump(os, ctx);
+        printField("clang_type", os.str());
+      }
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
 

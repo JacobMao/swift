@@ -130,7 +130,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     // Must check this first in case extensions have not been bound yet
     if (Walker.shouldWalkIntoGenericParams()) {
       if (auto *params = GC->getParsedGenericParams()) {
-        visitGenericParamList(params);
+        doIt(params);
       }
       return true;
     }
@@ -252,7 +252,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   
   bool visitOpaqueTypeDecl(OpaqueTypeDecl *OTD) {
     if (Walker.shouldWalkIntoGenericParams() && OTD->getGenericParams()) {
-      if (visitGenericParamList(OTD->getGenericParams()))
+      if (doIt(OTD->getGenericParams()))
         return true;
     }
     return false;
@@ -439,22 +439,6 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     return false;
   }
 
-  bool visitGenericParamList(GenericParamList *GPL) {
-    // Visit generic params
-    for (auto &P : GPL->getParams()) {
-      if (doIt(P))
-        return true;
-    }
-
-    // Visit param conformance
-    for (auto Req : GPL->getRequirements()) {
-      if (doIt(Req))
-        return true;
-    }
-
-    return false;
-  }
-
   //===--------------------------------------------------------------------===//
   //                                  Exprs
   //===--------------------------------------------------------------------===//
@@ -504,17 +488,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   Expr *visitOverloadedDeclRefExpr(OverloadedDeclRefExpr *E) { return E; }
   Expr *visitUnresolvedDeclRefExpr(UnresolvedDeclRefExpr *E) { return E; }
 
-  Expr *visitUnresolvedMemberExpr(UnresolvedMemberExpr *E) { 
-    if (E->getArgument()) {
-      if (auto arg = doIt(E->getArgument())) {
-        E->setArgument(arg);
-        return E;
-      }
-
-      return nullptr;
-    }
-    return E; 
-  }
+  Expr *visitUnresolvedMemberExpr(UnresolvedMemberExpr *E) { return E; }
 
   Expr *visitOpaqueValueExpr(OpaqueValueExpr *E) { return E; }
 
@@ -1352,10 +1326,26 @@ public:
         return true;
       break;
     case RequirementReprKind::LayoutConstraint:
-      if (doIt(Req.getFirstTypeRepr()))
+      if (doIt(Req.getSubjectRepr()))
         return true;
       break;
     }
+    return false;
+  }
+
+  bool doIt(GenericParamList *GPL) {
+    // Visit generic params
+    for (auto &P : GPL->getParams()) {
+      if (doIt(P))
+        return true;
+    }
+
+    // Visit param conformance
+    for (auto Req : GPL->getRequirements()) {
+      if (doIt(Req))
+        return true;
+    }
+
     return false;
   }
 };
@@ -1885,5 +1875,9 @@ StmtConditionElement *StmtConditionElement::walk(ASTWalker &walker) {
 }
 
 bool Decl::walk(ASTWalker &walker) {
+  return Traversal(walker).doIt(this);
+}
+
+bool GenericParamList::walk(ASTWalker &walker) {
   return Traversal(walker).doIt(this);
 }

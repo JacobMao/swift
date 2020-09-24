@@ -76,7 +76,7 @@ Type QuerySubstitutionMap::operator()(SubstitutableType *type) const {
 }
 
 void TypeLoc::setType(Type Ty) {
-  assert(!Ty || !Ty->hasTypeVariable());
+  assert(!Ty || !Ty->hasTypeVariable() || !Ty->hasHole());
   this->Ty = Ty;
 }
 
@@ -153,9 +153,7 @@ bool TypeBase::isAny() {
   return isEqual(getASTContext().TheAnyType);
 }
 
-bool TypeBase::isHole() {
-  return isEqual(getASTContext().TheUnresolvedType);
-}
+bool TypeBase::isHole() { return getCanonicalType()->is<HoleType>(); }
 
 bool TypeBase::isAnyClassReferenceType() {
   return getCanonicalType().isAnyClassReferenceType();
@@ -221,6 +219,7 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::LValue:
   case TypeKind::InOut:
   case TypeKind::TypeVariable:
+  case TypeKind::Hole:
   case TypeKind::BoundGenericEnum:
   case TypeKind::BoundGenericStruct:
   case TypeKind::SILToken:
@@ -1149,6 +1148,7 @@ CanType TypeBase::computeCanonicalType() {
   case TypeKind::Error:
   case TypeKind::Unresolved:
   case TypeKind::TypeVariable:
+  case TypeKind::Hole:
     llvm_unreachable("these types are always canonical");
 
 #define SUGARED_TYPE(id, parent) \
@@ -3063,8 +3063,8 @@ operator()(SubstitutableType *maybeOpaqueType) const {
           }))
     return maybeOpaqueType;
 
-  // If the type still contains opaque types, recur.
-  if (substTy->hasOpaqueArchetype()) {
+  // If the type changed, but still contains opaque types, recur.
+  if (!substTy->isEqual(maybeOpaqueType) && substTy->hasOpaqueArchetype()) {
     return ::substOpaqueTypesWithUnderlyingTypes(
         substTy, inContext, contextExpansion, isContextWholeModule);
   }
@@ -3428,9 +3428,13 @@ bool AnyFunctionType::hasSameExtInfoAs(const AnyFunctionType *otherFn) {
   return getExtInfo().isEqualTo(otherFn->getExtInfo(), useClangTypes(this));
 }
 
-// [TODO: Store-SIL-Clang-type]
 ClangTypeInfo SILFunctionType::getClangTypeInfo() const {
-  return ClangTypeInfo();
+  if (!Bits.SILFunctionType.HasClangTypeInfo)
+    return ClangTypeInfo();
+  auto *info = getTrailingObjects<ClangTypeInfo>();
+  assert(!info->empty() &&
+         "If the ClangTypeInfo was empty, we shouldn't have stored it.");
+  return *info;
 }
 
 bool SILFunctionType::hasSameExtInfoAs(const SILFunctionType *otherFn) {
@@ -4244,6 +4248,7 @@ case TypeKind::Id:
   case TypeKind::Error:
   case TypeKind::Unresolved:
   case TypeKind::TypeVariable:
+  case TypeKind::Hole:
   case TypeKind::GenericTypeParam:
   case TypeKind::SILToken:
   case TypeKind::Module:
@@ -4378,7 +4383,6 @@ case TypeKind::Id:
     return SILFunctionType::get(
         fnTy->getInvocationGenericSignature(),
         fnTy->getExtInfo(),
-        fnTy->isAsync(),
         fnTy->getCoroutineKind(),
         fnTy->getCalleeConvention(),
         transInterfaceParams,
@@ -4983,6 +4987,7 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::LValue:
   case TypeKind::InOut:
   case TypeKind::TypeVariable:
+  case TypeKind::Hole:
   case TypeKind::BoundGenericEnum:
   case TypeKind::BoundGenericStruct:
   case TypeKind::SILToken:
@@ -5372,7 +5377,7 @@ SILFunctionType::withInvocationSubstitutions(SubstitutionMap subs) const {
   assert(!subs || CanGenericSignature(subs.getGenericSignature())
                     == getInvocationGenericSignature());
   return SILFunctionType::get(getInvocationGenericSignature(),
-                          getExtInfo(), isAsync(), getCoroutineKind(),
+                          getExtInfo(), getCoroutineKind(),
                           getCalleeConvention(),
                           getParameters(), getYields(), getResults(),
                           getOptionalErrorResult(),
@@ -5390,7 +5395,7 @@ SILFunctionType::withPatternSubstitutions(SubstitutionMap subs) const {
   assert(!subs || CanGenericSignature(subs.getGenericSignature())
                     == getPatternGenericSignature());
   return SILFunctionType::get(getInvocationGenericSignature(),
-                          getExtInfo(), isAsync(), getCoroutineKind(),
+                          getExtInfo(), getCoroutineKind(),
                           getCalleeConvention(),
                           getParameters(), getYields(), getResults(),
                           getOptionalErrorResult(),
@@ -5409,7 +5414,7 @@ SILFunctionType::withPatternSpecialization(CanGenericSignature sig,
   assert(!subs || CanGenericSignature(subs.getGenericSignature())
                     == getSubstGenericSignature());
   return SILFunctionType::get(sig,
-                          getExtInfo(), isAsync(), getCoroutineKind(),
+                          getExtInfo(), getCoroutineKind(),
                           getCalleeConvention(),
                           getParameters(), getYields(), getResults(),
                           getOptionalErrorResult(),

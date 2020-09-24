@@ -39,6 +39,7 @@
 #include "swift/Basic/Statistic.h"
 #include "swift/Parse/Confusables.h"
 #include "swift/Parse/Lexer.h"
+#include "swift/Sema/CodeCompletionTypeChecking.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/FoldingSet.h"
@@ -340,14 +341,11 @@ static bool diagnoseOperatorJuxtaposition(UnresolvedDeclRefExpr *UDRE,
 
     // Perform name lookup for the first and second pieces.  If either fail to
     // be found, then it isn't a valid split.
-    NameLookupOptions LookupOptions = defaultUnqualifiedLookupOptions;
-    // This is only used for diagnostics, so always use KnownPrivate.
-    LookupOptions |= NameLookupFlags::KnownPrivate;
     auto startLookup = TypeChecker::lookupUnqualified(
-        DC, startName, UDRE->getLoc(), LookupOptions);
+        DC, startName, UDRE->getLoc(), defaultUnqualifiedLookupOptions);
     if (!startLookup) continue;
     auto endLookup = TypeChecker::lookupUnqualified(DC, endName, UDRE->getLoc(),
-                                                    LookupOptions);
+                                                    defaultUnqualifiedLookupOptions);
     if (!endLookup) continue;
 
     // If the overall operator is a binary one, then we're looking at
@@ -477,6 +475,46 @@ static bool findNonMembers(ArrayRef<LookupResultEntry> lookupResults,
   return AllDeclRefs;
 }
 
+/// Find the next element in a chain of members. If this expression is (or
+/// could be) the base of such a chain, this will return \c nullptr.
+static Expr *getMemberChainSubExpr(Expr *expr) {
+  assert(expr && "getMemberChainSubExpr called with null expr!");
+  if (auto *UDE = dyn_cast<UnresolvedDotExpr>(expr)) {
+    return UDE->getBase();
+  } else if (auto *CE = dyn_cast<CallExpr>(expr)) {
+    return CE->getFn();
+  } else if (auto *BOE = dyn_cast<BindOptionalExpr>(expr)) {
+    return BOE->getSubExpr();
+  } else if (auto *FVE = dyn_cast<ForceValueExpr>(expr)) {
+    return FVE->getSubExpr();
+  } else if (auto *SE = dyn_cast<SubscriptExpr>(expr)) {
+    return SE->getBase();
+  } else if (auto *CCE = dyn_cast<CodeCompletionExpr>(expr)) {
+    return CCE->getBase();
+  } else {
+    return nullptr;
+  }
+}
+
+UnresolvedMemberExpr *TypeChecker::getUnresolvedMemberChainBase(Expr *expr) {
+  if (auto *subExpr = getMemberChainSubExpr(expr))
+    return getUnresolvedMemberChainBase(subExpr);
+  else
+    return dyn_cast<UnresolvedMemberExpr>(expr);
+}
+
+/// Whether this expression is a member of a member chain.
+static bool isMemberChainMember(Expr *expr) {
+  return getMemberChainSubExpr(expr) != nullptr;
+}
+/// Whether this expression sits at the end of a chain of member accesses.
+static bool isMemberChainTail(Expr *expr, Expr *parent) {
+  assert(expr && "isMemberChainTail called with null expr!");
+  // If this expression's parent is not itself part of a chain (or, this expr
+  // has no parent expr), this must be the tail of the chain.
+  return parent == nullptr || !isMemberChainMember(parent);
+}
+
 /// Bind an UnresolvedDeclRefExpr by performing name lookup and
 /// returning the resultant expression. Context is the DeclContext used
 /// for the lookup.
@@ -495,13 +533,13 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
 
   // Perform standard value name lookup.
   NameLookupOptions lookupOptions = defaultUnqualifiedLookupOptions;
-  if (isa<AbstractFunctionDecl>(DC))
-    lookupOptions |= NameLookupFlags::KnownPrivate;
-
   // TODO: Include all of the possible members to give a solver a
   //       chance to diagnose name shadowing which requires explicit
   //       name/module qualifier to access top-level name.
   lookupOptions |= NameLookupFlags::IncludeOuterResults;
+
+  if (Loc.isInvalid())
+    DC = DC->getModuleScopeContext();
 
   auto Lookup = TypeChecker::lookupUnqualified(DC, Name, Loc, lookupOptions);
 
@@ -518,7 +556,6 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
 
     // Try ignoring access control.
     NameLookupOptions relookupOptions = lookupOptions;
-    relookupOptions |= NameLookupFlags::KnownPrivate;
     relookupOptions |= NameLookupFlags::IgnoreAccessControl;
     auto inaccessibleResults =
         TypeChecker::lookupUnqualified(DC, Name, Loc, relookupOptions);
@@ -1085,13 +1122,6 @@ namespace {
         }
       }
 
-      // If this is an unresolved member with a call argument (e.g.,
-      // .some(x)), record the argument expression.
-      if (auto unresolvedMember = dyn_cast<UnresolvedMemberExpr>(expr)) {
-        if (auto arg = unresolvedMember->getArgument())
-          CallArgs.insert(arg);
-      }
-
       // FIXME(diagnostics): `InOutType` could appear here as a result
       // of successful re-typecheck of the one of the sub-expressions e.g.
       // `let _: Int = { (s: inout S) in s.bar() }`. On the first
@@ -1326,6 +1356,14 @@ namespace {
       if (auto *simplified = simplifyTypeConstructionWithLiteralArg(expr))
         return simplified;
 
+      // If we find an unresolved member chain, wrap it in an
+      // UnresolvedMemberChainResultExpr (unless this has already been done).
+      auto *parent = Parent.getAsExpr();
+      if (isMemberChainTail(expr, parent))
+        if (auto *UME = TypeChecker::getUnresolvedMemberChainBase(expr))
+          if (!parent || !isa<UnresolvedMemberChainResultExpr>(parent))
+            return new (ctx) UnresolvedMemberChainResultExpr(expr, UME);
+
       return expr;
     }
 
@@ -1379,14 +1417,10 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
   // and not a TypeExpr.
   if (auto *DRE = dyn_cast<DeclRefExpr>(UDE->getBase())) {
     if (auto *TD = dyn_cast<TypeDecl>(DRE->getDecl())) {
-      auto lookupOptions = defaultMemberLookupOptions;
-      if (isa<AbstractFunctionDecl>(DC) ||
-          isa<AbstractClosureExpr>(DC))
-        lookupOptions |= NameLookupFlags::KnownPrivate;
-
       // See if the type has a member type with this name.
       auto Result = TypeChecker::lookupMemberType(
-          DC, TD->getDeclaredInterfaceType(), Name, lookupOptions);
+          DC, TD->getDeclaredInterfaceType(), Name,
+          defaultMemberLookupOptions);
 
       // If there is no nested type with this name, we have a lookup of
       // a non-type member, so leave the expression as-is.
@@ -1439,14 +1473,10 @@ TypeExpr *PreCheckExpression::simplifyNestedTypeExpr(UnresolvedDotExpr *UDE) {
     const auto BaseTy = resolution.resolveType(InnerTypeRepr);
 
     if (BaseTy->mayHaveMembers()) {
-      auto lookupOptions = defaultMemberLookupOptions;
-      if (isa<AbstractFunctionDecl>(DC) ||
-          isa<AbstractClosureExpr>(DC))
-        lookupOptions |= NameLookupFlags::KnownPrivate;
-
       // See if there is a member type with this name.
       auto Result =
-          TypeChecker::lookupMemberType(DC, BaseTy, Name, lookupOptions);
+          TypeChecker::lookupMemberType(DC, BaseTy, Name,
+                                        defaultMemberLookupOptions);
 
       // If there is no nested type with this name, we have a lookup of
       // a non-type member, so leave the expression as-is.
@@ -2120,6 +2150,14 @@ TypeChecker::typeCheckExpression(
                                   "typecheck-expr", expr);
   PrettyStackTraceExpr stackTrace(Context, "type-checking", expr);
 
+  // First let's check whether given expression has a code completion
+  // token which requires special handling.
+  if (Context.CompletionCallback &&
+      typeCheckForCodeCompletion(target, [&](const constraints::Solution &S) {
+        Context.CompletionCallback->sawSolution(S);
+      }))
+    return None;
+
   // First, pre-check the expression, validating any types that occur in the
   // expression and folding sequence expressions.
   if (ConstraintSystem::preCheckExpression(
@@ -2404,7 +2442,6 @@ bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
   // Create a 'let' binding to stand in for the RHS value.
   auto *matchVar = new (Context) VarDecl(/*IsStatic*/false,
                                          VarDecl::Introducer::Let,
-                                         /*IsCaptureList*/false,
                                          EP->getLoc(),
                                          Context.getIdentifier("$match"),
                                          DC);
@@ -2412,14 +2449,12 @@ bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
 
   matchVar->setImplicit();
   EP->setMatchVar(matchVar);
-  matchVar->setHasNonPatternBindingInit();
 
   // Find '~=' operators for the match.
-  auto lookupOptions = defaultUnqualifiedLookupOptions;
-  lookupOptions |= NameLookupFlags::KnownPrivate;
   auto matchLookup =
-      lookupUnqualified(DC, DeclNameRef(Context.Id_MatchOperator), SourceLoc(),
-                        lookupOptions);
+      lookupUnqualified(DC->getModuleScopeContext(),
+                        DeclNameRef(Context.Id_MatchOperator),
+                        SourceLoc(), defaultUnqualifiedLookupOptions);
   auto &diags = DC->getASTContext().Diags;
   if (!matchLookup) {
     diags.diagnose(EP->getLoc(), diag::no_match_operator);
@@ -3126,21 +3161,14 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
     return CheckedCastKind::ValueCast;
   };
 
-  // Strip optional wrappers off of the destination type in sync with
-  // stripping them off the origin type.
+  // TODO: Explore optionals using the same strategy used by the
+  // runtime.
+  // For now, if the target is more optional than the source,
+  // just defer it out for the runtime to handle.
   while (auto toValueType = toType->getOptionalObjectType()) {
-    // Complain if we're trying to increase optionality, e.g.
-    // casting an NSObject? to an NSString??.  That's not a subtype
-    // relationship.
     auto fromValueType = fromType->getOptionalObjectType();
     if (!fromValueType) {
-      if (!suppressDiagnostics) {
-        diags.diagnose(diagLoc, diag::downcast_to_more_optional,
-                       origFromType, origToType)
-          .highlight(diagFromRange)
-          .highlight(diagToRange);
-      }
-      return CheckedCastKind::Unresolved;
+      return CheckedCastKind::ValueCast;
     }
 
     toType = toValueType;
@@ -3839,8 +3867,6 @@ IsCallableNominalTypeRequest::evaluate(Evaluator &evaluator, CanType ty,
                                        DeclContext *dc) const {
   auto options = defaultMemberLookupOptions;
   options |= NameLookupFlags::IgnoreAccessControl;
-  if (isa<AbstractFunctionDecl>(dc))
-    options |= NameLookupFlags::KnownPrivate;
 
   // Look for a callAsFunction method.
   auto &ctx = ty->getASTContext();

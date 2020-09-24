@@ -51,9 +51,10 @@ public:
     GenerateDSYMJob,
     VerifyDebugInfoJob,
     GeneratePCHJob,
+    VerifyModuleInterfaceJob,
 
     JobFirst = CompileJob,
-    JobLast = GeneratePCHJob
+    JobLast = VerifyModuleInterfaceJob
   };
 
   static const char *getClassName(Kind AC);
@@ -328,15 +329,19 @@ public:
 class DynamicLinkJobAction : public JobAction {
   virtual void anchor() override;
   LinkKind Kind;
+  bool ShouldPerformLTO;
 
 public:
-  DynamicLinkJobAction(ArrayRef<const Action *> Inputs, LinkKind K)
+  DynamicLinkJobAction(ArrayRef<const Action *> Inputs, LinkKind K,
+                       bool ShouldPerformLTO)
       : JobAction(Action::Kind::DynamicLinkJob, Inputs, file_types::TY_Image),
-        Kind(K) {
+        Kind(K), ShouldPerformLTO(ShouldPerformLTO) {
     assert(Kind != LinkKind::None && Kind != LinkKind::StaticLibrary);
   }
 
   LinkKind getKind() const { return Kind; }
+
+  bool shouldPerformLTO() const { return ShouldPerformLTO; }
 
   static bool classof(const Action *A) {
     return A->getKind() == Action::Kind::DynamicLinkJob;
@@ -354,6 +359,26 @@ public:
 
   static bool classof(const Action *A) {
     return A->getKind() == Action::Kind::StaticLinkJob;
+  }
+};
+
+class VerifyModuleInterfaceJobAction : public JobAction {
+  virtual void anchor();
+  file_types::ID inputType;
+
+public:
+  VerifyModuleInterfaceJobAction(const Action * ModuleEmitter,
+                                 file_types::ID inputType)
+    : JobAction(Action::Kind::VerifyModuleInterfaceJob, { ModuleEmitter },
+                file_types::TY_Nothing), inputType(inputType) {
+    assert(inputType == file_types::TY_SwiftModuleInterfaceFile ||
+           inputType == file_types::TY_PrivateSwiftModuleInterfaceFile);
+  }
+
+  file_types::ID getInputType() const { return inputType; }
+
+  static bool classof(const Action *A) {
+    return A->getKind() == Action::Kind::VerifyModuleInterfaceJob;
   }
 };
 

@@ -55,7 +55,7 @@ const uint16_t SWIFTMODULE_VERSION_MAJOR = 0;
 /// describe what change you made. The content of this comment isn't important;
 /// it just ensures a conflict if two people change the module format.
 /// Don't worry about adhering to the 80-column limit for this line.
-const uint16_t SWIFTMODULE_VERSION_MINOR = 573; // @async on SILFunctionType
+const uint16_t SWIFTMODULE_VERSION_MINOR = 578; // Remove hasNonPatternBindingInit
 
 /// A standard hash seed used for all string hashes in a serialized module.
 ///
@@ -208,8 +208,8 @@ enum class ReadWriteImplKind : uint8_t {
   MutableAddress,
   MaterializeToTemporary,
   Modify,
-  StoredWithSimpleDidSet,
-  InheritedWithSimpleDidSet,
+  StoredWithDidSet,
+  InheritedWithDidSet,
 };
 using ReadWriteImplKindField = BCFixed<3>;
 
@@ -1250,7 +1250,6 @@ namespace decls_block {
     BCFixed<1>,   // explicitly objc?
     BCFixed<1>,   // static?
     VarDeclIntroducerField,   // introducer
-    BCFixed<1>,   // HasNonPatternBindingInit?
     BCFixed<1>,   // is getter mutating?
     BCFixed<1>,   // is setter mutating?
     BCFixed<1>,   // is this the backing storage for a lazy property?
@@ -1308,6 +1307,7 @@ namespace decls_block {
     AccessLevelField, // access level
     BCFixed<1>,   // requires a new vtable slot
     DeclIDField,  // opaque result type decl
+    BCFixed<1>,   // isUserAccessible?
     BCArray<IdentifierIDField> // name components,
                                // followed by TypeID dependencies
     // The record is trailed by:

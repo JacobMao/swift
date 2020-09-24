@@ -30,6 +30,7 @@
 
 namespace clang {
 class Type;
+class ASTContext;
 } // namespace clang
 
 namespace swift {
@@ -40,6 +41,7 @@ class FunctionType;
 class SILExtInfo;
 class SILExtInfoBuilder;
 class SILFunctionType;
+enum class SILFunctionTypeRepresentation : uint8_t;
 } // namespace swift
 
 namespace swift {
@@ -53,6 +55,7 @@ class ClangTypeInfo {
   friend ASTExtInfoBuilder;
   friend SILExtInfoBuilder;
 
+  // [NOTE: ClangTypeInfo-contents]
   // We preserve a full clang::Type *, not a clang::FunctionType * as:
   // 1. We need to keep sugar in case we need to present an error to the user
   //    (for AnyFunctionType).
@@ -77,7 +80,27 @@ public:
   /// Use the ClangModuleLoader to print the Clang type as a string.
   void printType(ClangModuleLoader *cml, llvm::raw_ostream &os) const;
 
-  void dump(llvm::raw_ostream &os) const;
+  void dump(llvm::raw_ostream &os, const clang::ASTContext &ctx) const;
+};
+
+// MARK: - UnexpectedClangTypeError
+/// Potential errors when trying to store a Clang type in an ExtInfo.
+struct UnexpectedClangTypeError {
+  enum class Kind {
+    NullForCOrBlock,
+    NonnullForNonCOrBlock,
+    NotBlockPointer,
+    NotFunctionPointerOrReference,
+    NonCanonical,
+  };
+  const Kind errorKind;
+  const clang::Type *type;
+
+  static Optional<UnexpectedClangTypeError> checkClangType(
+    SILFunctionTypeRepresentation fnRep, const clang::Type *type,
+    bool expectNonnullForCOrBlock, bool expectCanonical);
+
+  void dump();
 };
 
 // MARK: - FunctionTypeRepresentation
@@ -145,6 +168,41 @@ enum class SILFunctionTypeRepresentation : uint8_t {
   Closure,
 };
 
+constexpr SILFunctionTypeRepresentation
+convertRepresentation(FunctionTypeRepresentation rep) {
+  switch (rep) {
+  case FunctionTypeRepresentation::Swift:
+    return SILFunctionTypeRepresentation::Thick;
+  case FunctionTypeRepresentation::Block:
+    return SILFunctionTypeRepresentation::Block;
+  case FunctionTypeRepresentation::Thin:
+    return SILFunctionTypeRepresentation::Thin;
+  case FunctionTypeRepresentation::CFunctionPointer:
+    return SILFunctionTypeRepresentation::CFunctionPointer;
+  }
+  llvm_unreachable("Unhandled FunctionTypeRepresentation!");
+};
+
+inline Optional<FunctionTypeRepresentation>
+convertRepresentation(SILFunctionTypeRepresentation rep) {
+  switch (rep) {
+  case SILFunctionTypeRepresentation::Thick:
+    return {FunctionTypeRepresentation::Swift};
+  case SILFunctionTypeRepresentation::Block:
+    return {FunctionTypeRepresentation::Block};
+  case SILFunctionTypeRepresentation::Thin:
+    return {FunctionTypeRepresentation::Thin};
+  case SILFunctionTypeRepresentation::CFunctionPointer:
+    return {FunctionTypeRepresentation::CFunctionPointer};
+  case SILFunctionTypeRepresentation::Method:
+  case SILFunctionTypeRepresentation::ObjCMethod:
+  case SILFunctionTypeRepresentation::WitnessMethod:
+  case SILFunctionTypeRepresentation::Closure:
+    return None;
+  }
+  llvm_unreachable("Unhandled SILFunctionTypeRepresentation!");
+};
+
 /// Can this calling convention result in a function being called indirectly
 /// through the runtime.
 constexpr bool canBeCalledIndirectly(SILFunctionTypeRepresentation rep) {
@@ -162,6 +220,25 @@ constexpr bool canBeCalledIndirectly(SILFunctionTypeRepresentation rep) {
   }
 
   llvm_unreachable("Unhandled SILFunctionTypeRepresentation in switch.");
+}
+
+template <typename Repr> constexpr bool shouldStoreClangType(Repr repr) {
+  static_assert(std::is_same<Repr, FunctionTypeRepresentation>::value ||
+                    std::is_same<Repr, SILFunctionTypeRepresentation>::value,
+                "Expected a Representation type as the argument type.");
+  switch (static_cast<SILFunctionTypeRepresentation>(repr)) {
+  case SILFunctionTypeRepresentation::CFunctionPointer:
+  case SILFunctionTypeRepresentation::Block:
+    return true;
+  case SILFunctionTypeRepresentation::ObjCMethod:
+  case SILFunctionTypeRepresentation::Thick:
+  case SILFunctionTypeRepresentation::Thin:
+  case SILFunctionTypeRepresentation::Method:
+  case SILFunctionTypeRepresentation::WitnessMethod:
+  case SILFunctionTypeRepresentation::Closure:
+    return false;
+  }
+  llvm_unreachable("Unhandled SILFunctionTypeRepresentation.");
 }
 
 // MARK: - ASTExtInfoBuilder
@@ -194,16 +271,8 @@ class ASTExtInfoBuilder {
 
   using Representation = FunctionTypeRepresentation;
 
-  static void assertIsFunctionType(const clang::Type *);
-
   ASTExtInfoBuilder(unsigned bits, ClangTypeInfo clangTypeInfo)
-      : bits(bits), clangTypeInfo(clangTypeInfo) {
-    // TODO: [clang-function-type-serialization] Once we start serializing
-    // the Clang type, we should also assert that the pointer is non-null.
-    auto Rep = Representation(bits & RepresentationMask);
-    if ((Rep == Representation::CFunctionPointer) && clangTypeInfo.type)
-      assertIsFunctionType(clangTypeInfo.type);
-  }
+      : bits(bits), clangTypeInfo(clangTypeInfo) {}
 
 public:
   // Constructor with all defaults.
@@ -254,10 +323,7 @@ public:
            DifferentiabilityKind::NonDifferentiable;
   }
 
-  /// Get the underlying ClangTypeInfo value if it is not the default value.
-  Optional<ClangTypeInfo> getClangTypeInfo() const {
-    return clangTypeInfo.empty() ? Optional<ClangTypeInfo>() : clangTypeInfo;
-  }
+  ClangTypeInfo getClangTypeInfo() const { return clangTypeInfo; }
 
   constexpr SILFunctionTypeRepresentation getSILRepresentation() const {
     unsigned rawRep = bits & RepresentationMask;
@@ -302,7 +368,8 @@ public:
   LLVM_NODISCARD
   ASTExtInfoBuilder withRepresentation(Representation rep) const {
     return ASTExtInfoBuilder((bits & ~RepresentationMask) | (unsigned)rep,
-                             clangTypeInfo);
+                             shouldStoreClangType(rep) ? clangTypeInfo
+                                                       : ClangTypeInfo());
   }
   LLVM_NODISCARD
   ASTExtInfoBuilder withNoEscape(bool noEscape = true) const {
@@ -343,7 +410,8 @@ public:
   ASTExtInfoBuilder
   withSILRepresentation(SILFunctionTypeRepresentation rep) const {
     return ASTExtInfoBuilder((bits & ~RepresentationMask) | (unsigned)rep,
-                             clangTypeInfo);
+                             shouldStoreClangType(rep) ? clangTypeInfo
+                                                       : ClangTypeInfo());
   }
 
   bool isEqualTo(ASTExtInfoBuilder other, bool useClangTypes) const {
@@ -370,12 +438,16 @@ class ASTExtInfo {
 
   ASTExtInfoBuilder builder;
 
+  // Only for use by ASTExtInfoBuilder::build. Don't use it elsewhere!
   ASTExtInfo(ASTExtInfoBuilder builder) : builder(builder) {}
+
   ASTExtInfo(unsigned bits, ClangTypeInfo clangTypeInfo)
-      : builder(bits, clangTypeInfo){};
+      : builder(bits, clangTypeInfo) {
+    builder.checkInvariants();
+  };
 
 public:
-  ASTExtInfo() : builder(){};
+  ASTExtInfo() : builder() { builder.checkInvariants(); };
 
   /// Create a builder with the same state as \c this.
   ASTExtInfoBuilder intoBuilder() const { return builder; }
@@ -404,9 +476,7 @@ public:
 
   constexpr bool isDifferentiable() const { return builder.isDifferentiable(); }
 
-  Optional<ClangTypeInfo> getClangTypeInfo() const {
-    return builder.getClangTypeInfo();
-  }
+  ClangTypeInfo getClangTypeInfo() const { return builder.getClangTypeInfo(); }
 
   constexpr bool hasSelfParam() const { return builder.hasSelfParam(); }
 
@@ -495,16 +565,17 @@ class SILExtInfoBuilder {
   // If bits are added or removed, then TypeBase::SILFunctionTypeBits
   // and NumMaskBits must be updated, and they must match.
 
-  //   |representation|pseudogeneric| noescape |differentiability|
-  //   |    0 .. 3    |      4      |     5    |      6 .. 7     |
+  //   |representation|pseudogeneric| noescape | async | differentiability|
+  //   |    0 .. 3    |      4      |     5    |   6   |      7 .. 8     |
   //
   enum : unsigned {
     RepresentationMask = 0xF << 0,
     PseudogenericMask = 1 << 4,
     NoEscapeMask = 1 << 5,
-    DifferentiabilityMaskOffset = 6,
+    AsyncMask = 1 << 6,
+    DifferentiabilityMaskOffset = 7,
     DifferentiabilityMask = 0x3 << DifferentiabilityMaskOffset,
-    NumMaskBits = 8
+    NumMaskBits = 9
   };
 
   unsigned bits; // Naturally sized for speed.
@@ -515,21 +586,34 @@ class SILExtInfoBuilder {
   using Representation = SILFunctionTypeRepresentation;
 
   SILExtInfoBuilder(unsigned bits, ClangTypeInfo clangTypeInfo)
-      : bits(bits), clangTypeInfo(clangTypeInfo) {}
+      : bits(bits), clangTypeInfo(clangTypeInfo.getCanonical()) {}
+
+  static constexpr unsigned makeBits(Representation rep, bool isPseudogeneric,
+                                     bool isNoEscape, bool isAsync,
+                                     DifferentiabilityKind diffKind) {
+    return ((unsigned)rep) | (isPseudogeneric ? PseudogenericMask : 0) |
+           (isNoEscape ? NoEscapeMask : 0) | (isAsync ? AsyncMask : 0) |
+           (((unsigned)diffKind << DifferentiabilityMaskOffset) &
+            DifferentiabilityMask);
+  }
 
 public:
   // Constructor with all defaults.
-  SILExtInfoBuilder() : bits(0), clangTypeInfo(ClangTypeInfo(nullptr)) {}
+  SILExtInfoBuilder() : SILExtInfoBuilder(0, ClangTypeInfo(nullptr)) {}
 
   // Constructor for polymorphic type.
   SILExtInfoBuilder(Representation rep, bool isPseudogeneric, bool isNoEscape,
-                    DifferentiabilityKind diffKind, const clang::Type *type)
-      : SILExtInfoBuilder(
-            ((unsigned)rep) | (isPseudogeneric ? PseudogenericMask : 0) |
-                (isNoEscape ? NoEscapeMask : 0) |
-                (((unsigned)diffKind << DifferentiabilityMaskOffset) &
-                 DifferentiabilityMask),
-            ClangTypeInfo(type)) {}
+                    bool isAsync, DifferentiabilityKind diffKind,
+                    const clang::Type *type)
+      : SILExtInfoBuilder(makeBits(rep, isPseudogeneric, isNoEscape, isAsync,
+                                   diffKind),
+                          ClangTypeInfo(type)) {}
+
+  SILExtInfoBuilder(ASTExtInfoBuilder info, bool isPseudogeneric)
+      : SILExtInfoBuilder(makeBits(info.getSILRepresentation(), isPseudogeneric,
+                                   info.isNoEscape(), info.isAsync(),
+                                   info.getDifferentiabilityKind()),
+                          info.getClangTypeInfo()) {}
 
   void checkInvariants() const;
 
@@ -552,6 +636,8 @@ public:
   // Is this function guaranteed to be no-escape by the type system?
   constexpr bool isNoEscape() const { return bits & NoEscapeMask; }
 
+  constexpr bool isAsync() const { return bits & AsyncMask; }
+
   constexpr DifferentiabilityKind getDifferentiabilityKind() const {
     return DifferentiabilityKind((bits & DifferentiabilityMask) >>
                                  DifferentiabilityMaskOffset);
@@ -562,10 +648,8 @@ public:
            DifferentiabilityKind::NonDifferentiable;
   }
 
-  /// Get the underlying ClangTypeInfo value if it is not the default value.
-  Optional<ClangTypeInfo> getClangTypeInfo() const {
-    return clangTypeInfo.empty() ? Optional<ClangTypeInfo>() : clangTypeInfo;
-  }
+  /// Get the underlying ClangTypeInfo value.
+  ClangTypeInfo getClangTypeInfo() const { return clangTypeInfo; }
 
   constexpr bool hasSelfParam() const {
     switch (getRepresentation()) {
@@ -604,7 +688,8 @@ public:
   // the following with methods instead of mutating these objects.
   SILExtInfoBuilder withRepresentation(Representation rep) const {
     return SILExtInfoBuilder((bits & ~RepresentationMask) | (unsigned)rep,
-                             clangTypeInfo);
+                             shouldStoreClangType(rep) ? clangTypeInfo
+                                                       : ClangTypeInfo());
   }
   SILExtInfoBuilder withIsPseudogeneric(bool isPseudogeneric = true) const {
     return SILExtInfoBuilder(isPseudogeneric ? (bits | PseudogenericMask)
@@ -616,12 +701,20 @@ public:
                                       : (bits & ~NoEscapeMask),
                              clangTypeInfo);
   }
+  SILExtInfoBuilder withAsync(bool isAsync = true) const {
+    return SILExtInfoBuilder(isAsync ? (bits | AsyncMask) : (bits & ~AsyncMask),
+                             clangTypeInfo);
+  }
   SILExtInfoBuilder
   withDifferentiabilityKind(DifferentiabilityKind differentiability) const {
     return SILExtInfoBuilder(
         (bits & ~DifferentiabilityMask) |
             ((unsigned)differentiability << DifferentiabilityMaskOffset),
         clangTypeInfo);
+  }
+  LLVM_NODISCARD
+  SILExtInfoBuilder withClangFunctionType(const clang::Type *type) const {
+    return SILExtInfoBuilder(bits, ClangTypeInfo(type).getCanonical());
   }
 
   bool isEqualTo(SILExtInfoBuilder other, bool useClangTypes) const {
@@ -648,17 +741,26 @@ class SILExtInfo {
 
   SILExtInfoBuilder builder;
 
+  // Only for use by SILExtInfoBuilder::build. Don't use it elsewhere!
   SILExtInfo(SILExtInfoBuilder builder) : builder(builder) {}
+
   SILExtInfo(unsigned bits, ClangTypeInfo clangTypeInfo)
-      : builder(bits, clangTypeInfo){};
+      : builder(bits, clangTypeInfo) {
+    builder.checkInvariants();
+  };
 
 public:
-  SILExtInfo() : builder(){};
+  SILExtInfo() : builder() { builder.checkInvariants(); };
+
+  SILExtInfo(ASTExtInfo info, bool isPseudogeneric)
+      : builder(info.intoBuilder(), isPseudogeneric) {
+    builder.checkInvariants();
+  }
 
   static SILExtInfo getThin() {
     return SILExtInfoBuilder(SILExtInfoBuilder::Representation::Thin, false,
-                             false, DifferentiabilityKind::NonDifferentiable,
-                             nullptr)
+                             false, false,
+                             DifferentiabilityKind::NonDifferentiable, nullptr)
         .build();
   }
 
@@ -681,15 +783,15 @@ public:
 
   constexpr bool isNoEscape() const { return builder.isNoEscape(); }
 
+  constexpr bool isAsync() const { return builder.isAsync(); }
+
   constexpr DifferentiabilityKind getDifferentiabilityKind() const {
     return builder.getDifferentiabilityKind();
   }
 
   constexpr bool isDifferentiable() const { return builder.isDifferentiable(); }
 
-  Optional<ClangTypeInfo> getClangTypeInfo() const {
-    return builder.getClangTypeInfo();
-  }
+  ClangTypeInfo getClangTypeInfo() const { return builder.getClangTypeInfo(); }
 
   constexpr bool hasSelfParam() const { return builder.hasSelfParam(); }
 
@@ -716,6 +818,8 @@ public:
   constexpr std::pair<unsigned, const void *> getFuncAttrKey() const {
     return builder.getFuncAttrKey();
   }
+
+  Optional<UnexpectedClangTypeError> checkClangType() const;
 };
 
 /// Helper function to obtain the useClangTypes parameter for checking equality

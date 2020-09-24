@@ -443,6 +443,17 @@ def emit_module_path_EQ : Joined<["-"], "emit-module-path=">,
          ArgumentIsPath, SupplementaryOutput]>,
   Alias<emit_module_path>;
 
+def emit_module_summary :
+  Flag<["-"], "emit-module-summary">,
+  Flags<[NoInteractiveOption, DoesNotAffectIncrementalBuild,
+         SupplementaryOutput]>,
+  HelpText<"Output module summary file">;
+def emit_module_summary_path :
+  Separate<["-"], "emit-module-summary-path">,
+  Flags<[FrontendOption, NoInteractiveOption, DoesNotAffectIncrementalBuild,
+         ArgumentIsPath, SupplementaryOutput]>,
+  MetaVarName<"<path>">, HelpText<"Output module summary file to <path>">;
+
 def emit_module_interface :
   Flag<["-"], "emit-module-interface">,
   Flags<[NoInteractiveOption, DoesNotAffectIncrementalBuild,
@@ -459,6 +470,15 @@ def emit_private_module_interface_path :
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden,
          DoesNotAffectIncrementalBuild, ArgumentIsPath, SupplementaryOutput]>,
   MetaVarName<"<path>">, HelpText<"Output private module interface file to <path>">;
+
+def verify_emitted_module_interface :
+  Flag<["-"], "verify-emitted-module-interface">,
+  Flags<[NoInteractiveOption, DoesNotAffectIncrementalBuild]>,
+  HelpText<"Check that module interfaces emitted during compilation typecheck">;
+def no_verify_emitted_module_interface :
+  Flag<["-"], "no-verify-emitted-module-interface">,
+  Flags<[NoInteractiveOption, DoesNotAffectIncrementalBuild]>,
+  HelpText<"Don't check that module interfaces emitted during compilation typecheck">;
 
 def avoid_emit_module_source_info :
   Flag<["-"], "avoid-emit-module-source-info">,
@@ -555,16 +575,6 @@ def enable_fuzzy_forward_scan_trailing_closure_matching : Flag<["-"],
     "enable-fuzzy-forward-scan-trailing-closure-matching">,
   Flags<[FrontendOption]>,
   HelpText<"Enable fuzzy forward-scan trailing closure matching">;
-
-def enable_direct_intramodule_dependencies : Flag<["-"],
-    "enable-direct-intramodule-dependencies">,
-  Flags<[FrontendOption, HelpHidden]>,
-  HelpText<"Enable experimental dependency tracking that never cascades">;
-
-def disable_direct_intramodule_dependencies : Flag<["-"],
-    "disable-direct-intramodule-dependencies">,
-  Flags<[FrontendOption, HelpHidden]>,
-  HelpText<"Disable experimental dependency tracking that never cascades">;
 
 def enable_experimental_cxx_interop :
   Flag<["-"], "enable-experimental-cxx-interop">,
@@ -1097,14 +1107,6 @@ def scan_dependencies : Flag<["-"], "scan-dependencies">,
 def scan_clang_dependencies : Flag<["-"], "scan-clang-dependencies">,
   HelpText<"Scan dependencies of the given Clang module">, ModeOpt,
   Flags<[FrontendOption, NoInteractiveOption, DoesNotAffectIncrementalBuild]>;
-
-def enable_astscope_lookup : Flag<["-"], "enable-astscope-lookup">,
-  Flags<[FrontendOption]>,
-  HelpText<"Enable ASTScope-based unqualified name lookup">;
-
-def disable_astscope_lookup : Flag<["-"], "disable-astscope-lookup">,
-  Flags<[FrontendOption]>,
-  HelpText<"Disable ASTScope-based unqualified name lookup">;
 
 def disable_parser_lookup : Flag<["-"], "disable-parser-lookup">,
   Flags<[FrontendOption]>,

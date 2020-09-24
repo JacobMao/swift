@@ -134,7 +134,7 @@ class ExplicitSwiftModuleLoader: public SerializedModuleLoaderBase {
                                      ModuleLoadingMode loadMode,
                                      bool IgnoreSwiftSourceInfoFile);
 
-  bool findModule(AccessPathElem moduleID,
+  bool findModule(ImportPath::Element moduleID,
                   SmallVectorImpl<char> *moduleInterfacePath,
                   std::unique_ptr<llvm::MemoryBuffer> *moduleBuffer,
                   std::unique_ptr<llvm::MemoryBuffer> *moduleDocBuffer,
@@ -142,7 +142,7 @@ class ExplicitSwiftModuleLoader: public SerializedModuleLoaderBase {
                   bool &isFramework, bool &isSystemModule) override;
 
   std::error_code findModuleFilesInDirectory(
-                  AccessPathElem ModuleID,
+                  ImportPath::Element ModuleID,
                   const SerializedModuleBaseName &BaseName,
                   SmallVectorImpl<char> *ModuleInterfacePath,
                   std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
@@ -150,7 +150,7 @@ class ExplicitSwiftModuleLoader: public SerializedModuleLoaderBase {
                   std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
                   bool IsFramework) override;
 
-  bool canImportModule(Located<Identifier> mID) override;
+  bool canImportModule(ImportPath::Element mID) override;
 
   bool isCached(StringRef DepPath) override { return false; };
 
@@ -285,6 +285,8 @@ private:
 };
 
 struct ModuleInterfaceLoaderOptions {
+  FrontendOptions::ActionType requestedAction =
+      FrontendOptions::ActionType::EmitModuleOnly;
   bool remarkOnRebuildFromInterface = false;
   bool disableInterfaceLock = false;
   bool disableImplicitSwiftModule = false;
@@ -293,7 +295,17 @@ struct ModuleInterfaceLoaderOptions {
     remarkOnRebuildFromInterface(Opts.RemarkOnRebuildFromModuleInterface),
     disableInterfaceLock(Opts.DisableInterfaceFileLock),
     disableImplicitSwiftModule(Opts.DisableImplicitModules),
-    mainExecutablePath(Opts.MainExecutablePath) {}
+    mainExecutablePath(Opts.MainExecutablePath)
+  {
+    switch (Opts.RequestedAction) {
+    case FrontendOptions::ActionType::TypecheckModuleFromInterface:
+      requestedAction = FrontendOptions::ActionType::Typecheck;
+      break;
+    default:
+      requestedAction = FrontendOptions::ActionType::EmitModuleOnly;
+      break;
+    }
+  }
   ModuleInterfaceLoaderOptions() = default;
 };
 
@@ -320,7 +332,7 @@ class ModuleInterfaceLoader : public SerializedModuleLoaderBase {
   ModuleInterfaceLoaderOptions Opts;
 
   std::error_code findModuleFilesInDirectory(
-     AccessPathElem ModuleID,
+     ImportPath::Element ModuleID,
      const SerializedModuleBaseName &BaseName,
      SmallVectorImpl<char> *ModuleInterfacePath,
      std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
@@ -408,8 +420,8 @@ public:
                                   DiagnosticEngine &Diags,
                                   const SearchPathOptions &searchPathOpts,
                                   const LangOptions &langOpts,
+                                  const ClangImporterOptions &clangImporterOpts,
                                   ModuleInterfaceLoaderOptions LoaderOpts,
-                                  ClangModuleLoader *clangImporter,
                                   bool buildModuleCacheDirIfAbsent,
                                   StringRef moduleCachePath,
                                   StringRef prebuiltCachePath,
@@ -436,7 +448,6 @@ public:
                                     llvm::SmallString<256> &OutPath,
                                     StringRef &CacheHash);
   std::string getCacheHash(StringRef useInterfacePath);
-  void addExtraClangArg(StringRef Arg);
 };
 }
 
